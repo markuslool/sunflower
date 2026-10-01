@@ -44,7 +44,7 @@ public class SunflowerClient implements ClientModInitializer {
 											ctx.getSource().sendFeedback(Component.literal(
 													"§e[Sunflower RT] §fdebug=" + mode + " (0 shadows, 1 blacken surfaces, 2 half screen)"));
 											return 1;
-										}))))));
+										})))));
 	}
 
 	/** Текущий экран (в 26.2 живет в {@code mc.gui}). */
