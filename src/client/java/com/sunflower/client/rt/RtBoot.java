@@ -112,7 +112,7 @@ public final class RtBoot {
         out.add("enabled=" + config.enabled + " stride=" + config.rayStride + " (full-res v1)"
                 + " dist=" + config.shadowDistance + " steps=" + config.maxSteps);
         out.add("overlay ready=" + RtOverlay.isReady() + " frames=" + RtOverlay.framesDrawn()
-                + " debug=" + RtOverlay.debugMode() + " state=" + RtOverlay.skipReason());
+                + " debug=" + RtOverlay.debugMode() + " bob=" + RtOverlay.useBob() + " state=" + RtOverlay.skipReason());
         out.add("sun=(" + String.format("%.2f", RtOverlay.lastSunX()) + "," + String.format("%.2f", RtOverlay.lastSunY())
                 + ") strength=" + String.format("%.2f", RtOverlay.lastStrength()));
         out.add("volume=" + volume.width() + "x" + volume.height() + "x" + volume.depth()

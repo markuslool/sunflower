@@ -57,20 +57,24 @@ void main() {
     vec3 ro = CamPos;
     vec3 rd = normalize(wp4.xyz / wp4.w);
 
-    // Primary march: first OPAQUE voxel. Translucent/emissive/air are see-through.
+    // Primary march: first OPAQUE (1) or LEAF (4) voxel. Codes 0/2/3 are see-through.
     ivec3 cell;
     ivec3 stepI;
     vec3 tMax;
     vec3 tDelta;
     ddaInit(ro, rd, cell, stepI, tMax, tDelta);
-    if (voxelAt(cell) == 1u) {
-        fragColor = vec4(1.0); // camera inside solid, fail open
-        return;
-    }
     float primaryMax = Params.w;
     float t = 0.0;
     vec3 nrm = vec3(0.0);
     bool hit = false;
+    // Primary останавливается на непрозрачном (1) И на листве (4):
+    // пиксель кроны должен освещаться как крона, а не как земля за ней.
+    // Иначе свет «протекает сквозь блоки». Прозрачные 2/3 — насквозь.
+    uint startM = voxelAt(cell);
+    if (startM == 1u || startM == 4u) {
+        fragColor = vec4(1.0); // камера внутри твердого, fail open
+        return;
+    }
     for (int i = 0; i < 320 && t <= primaryMax; i++) {
         if (tMax.x < tMax.y && tMax.x < tMax.z) {
             cell.x += stepI.x;
@@ -88,7 +92,7 @@ void main() {
             tMax.z += tDelta.z;
             nrm = vec3(0.0, 0.0, float(-stepI.z));
         }
-        if (voxelAt(cell) == 1u) {
+        if (voxelAt(cell) == 1u || voxelAt(cell) == 4u) {
             hit = true;
             break;
         }

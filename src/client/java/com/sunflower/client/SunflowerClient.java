@@ -1,5 +1,6 @@
 package com.sunflower.client;
 
+import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.sunflower.client.rt.RtBoot;
 import com.sunflower.client.rt.RtOverlay;
 import net.fabricmc.api.ClientModInitializer;
@@ -16,35 +17,44 @@ public class SunflowerClient implements ClientModInitializer {
 		RtBoot.init();
 
 		// Повторные пробы бэкенда + приветствие в чат при входе в мир.
-		// TODO тебе: когда появится render-hook, дергать RtBoot.shouldRenderRt() в нем.
 		ClientTickEvents.END_CLIENT_TICK.register(client -> RtBoot.tick());
 
 		// /sunflower rt — экран настроек (временно, до кнопки в Video Settings 26.2).
 		// /sunflower status — диагностика в чат без копания в логах.
-		ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) ->
-				dispatcher.register(ClientCommands.literal("sunflower")
-						.then(ClientCommands.literal("rt")
-								.executes(ctx -> {
-									Minecraft mc = Minecraft.getInstance();
-									RtSettingsScreen.open(mc.gui.screen());
-									return 1;
-								}))
-						.then(ClientCommands.literal("status")
-								.executes(ctx -> {
-									for (String line : RtBoot.statusLines()) {
-										ctx.getSource().sendFeedback(Component.literal("§e[Sunflower RT] §f" + line));
-									}
-									return 1;
-								}))
-						.then(ClientCommands.literal("debug")
-								.then(ClientCommands.argument("mode", com.mojang.brigadier.arguments.IntegerArgumentType.integer(0, 2))
-										.executes(ctx -> {
-											int mode = com.mojang.brigadier.arguments.IntegerArgumentType.getInteger(ctx, "mode");
-											RtOverlay.setDebugMode(mode);
-											ctx.getSource().sendFeedback(Component.literal(
-													"§e[Sunflower RT] §fdebug=" + mode + " (0 shadows, 1 blacken surfaces, 2 half screen)"));
-											return 1;
-										})))));
+		// /sunflower debug <0|1|2> — режимы визуализации.
+		// /sunflower bob <0|1> — матрица лучей: базовая проекция или с view-bob.
+		ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
+			var root = ClientCommands.literal("sunflower");
+
+			root.then(ClientCommands.literal("rt").executes(ctx -> {
+				Minecraft mc = Minecraft.getInstance();
+				RtSettingsScreen.open(mc.gui.screen());
+				return 1;
+			}));
+
+			root.then(ClientCommands.literal("status").executes(ctx -> {
+				for (String line : RtBoot.statusLines()) {
+					ctx.getSource().sendFeedback(Component.literal("§e[Sunflower RT] §f" + line));
+				}
+				return 1;
+			}));
+
+			root.then(ClientCommands.literal("debug").then(ClientCommands.argument("mode", IntegerArgumentType.integer(0, 2)).executes(ctx -> {
+				int mode = IntegerArgumentType.getInteger(ctx, "mode");
+				RtOverlay.setDebugMode(mode);
+				ctx.getSource().sendFeedback(Component.literal("§e[Sunflower RT] §fdebug=" + mode + " (0 shadows, 1 blacken surfaces, 2 half screen)"));
+				return 1;
+			})));
+
+			root.then(ClientCommands.literal("bob").then(ClientCommands.argument("mode", IntegerArgumentType.integer(0, 1)).executes(ctx -> {
+				int mode = IntegerArgumentType.getInteger(ctx, "mode");
+				RtOverlay.setUseBob(mode);
+				ctx.getSource().sendFeedback(Component.literal("§e[Sunflower RT] §fbob=" + mode + " (0 base projection, 1 +view-bob). Walk and compare."));
+				return 1;
+			})));
+
+			dispatcher.register(root);
+		});
 	}
 
 	/** Текущий экран (в 26.2 живет в {@code mc.gui}). */

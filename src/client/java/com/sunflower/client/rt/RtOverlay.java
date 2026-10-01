@@ -62,6 +62,13 @@ public final class RtOverlay {
     private static volatile Level lastLevel;
     /** 0 = тени, 1 = чернить найденные поверхности, 2 = весь экран -50% (проверка пасса). */
     private static volatile int debugMode;
+    /**
+     * 0 = лучи по базовой проекции (как Sodium-террейн, предположительно),
+     * 1 = с ванильным view-bob (bobHurt/bobView).
+     * Переключается командой /sunflower bob — какая матрица совпадает с террейном,
+     * та и правильная; статическим анализом не решилось (Sodium хранит свою копию).
+     */
+    private static volatile int useBob;
 
     private RtOverlay() {}
 
@@ -96,6 +103,16 @@ public final class RtOverlay {
     public static void setDebugMode(int mode) {
         debugMode = Math.max(0, Math.min(2, mode));
         Sunflower.LOGGER.warn("[sunflower-rt] debug mode = {}", debugMode);
+    }
+
+    public static int useBob() {
+        return useBob;
+    }
+
+    public static void setUseBob(int mode) {
+        useBob = mode != 0 ? 1 : 0;
+        Sunflower.LOGGER.warn("[sunflower-rt] useBob = {} ({})", useBob,
+                useBob != 0 ? "с view-bob" : "базовая проекция");
     }
 
     private static synchronized void ensureInit() {
@@ -136,8 +153,11 @@ public final class RtOverlay {
 
     /**
      * Рисует оверлей. Вызывать в хвосте GameRenderer.renderLevel (render-поток).
+     *
+     * @param levelProj проекция УЖЕ с view-bob (миксин повторяет ванильные
+     *                  bobHurt/bobView) — лучи совпадают с отрендеренным кадром.
      */
-    public static void render(GameRenderer gameRenderer, DeltaTracker deltaTracker) {
+    public static void render(GameRenderer gameRenderer, DeltaTracker deltaTracker, Matrix4f levelProj) {
         if (!RtBoot.isVulkanActive() || !RtBoot.config().enabled) {
             skipReason = "disabled";
             return;
@@ -190,8 +210,12 @@ public final class RtOverlay {
         }
 
         // Кадр: inv(P*V), камера, солнце, бокс, параметры.
+        // Шагов принудительно >= 2x дистанции: диагональ ест ~1.73 вокселя/блок,
+        // иначе длинные лучи обрываются раньше препятствия и свет протекает.
+        // (Защита от старого конфига, где maxSteps мог остаться 64 при dist 64.)
         RtConfig cfg = RtBoot.config();
-        Matrix4f invVp = new Matrix4f(cam.projectionMatrix).mul(cam.viewRotationMatrix).invert();
+        int effSteps = Math.max(cfg.maxSteps, cfg.shadowDistance * 2);
+        Matrix4f invVp = new Matrix4f(levelProj).mul(cam.viewRotationMatrix).invert();
         int fw = grs.windowRenderState.width;
         int fh = grs.windowRenderState.height;
         GpuBuffer frame = frameUbo.currentBuffer();
@@ -202,7 +226,7 @@ public final class RtOverlay {
                     .putVec3((float) sunX, (float) sunY, 0.0F)
                     .putIVec3(vol.originX(), vol.originY(), vol.originZ())
                     .putIVec3(vol.width(), vol.height(), vol.depth())
-                    .putVec4((float) cfg.shadowDistance, (float) cfg.maxSteps, strength, 160.0F)
+                    .putVec4((float) cfg.shadowDistance, (float) effSteps, strength, 160.0F)
                     .putVec4((float) fw, (float) fh, (float) debugMode, 0.0F);
         }
 
