@@ -82,16 +82,14 @@ public final class RtSettingsScreen extends Screen {
         y += step;
 
         addRenderableWidget(Button.builder(
-                Component.literal("Макс. шагов DDA: " + cfg.maxSteps + " [32/64/96/128]"),
+                Component.literal("Макс. шагов DDA: " + cfg.maxSteps + " [64/128/192]"),
                 b -> {
-                    if (cfg.maxSteps < 64) {
-                        cfg.maxSteps = 64;
-                    } else if (cfg.maxSteps < 96) {
-                        cfg.maxSteps = 96;
-                    } else if (cfg.maxSteps < 128) {
+                    if (cfg.maxSteps < 128) {
                         cfg.maxSteps = 128;
+                    } else if (cfg.maxSteps < 192) {
+                        cfg.maxSteps = 192;
                     } else {
-                        cfg.maxSteps = 32;
+                        cfg.maxSteps = 64;
                     }
                     RtBoot.saveConfig();
                     rebuildWidgets();

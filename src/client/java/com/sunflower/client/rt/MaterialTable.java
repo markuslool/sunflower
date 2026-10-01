@@ -23,6 +23,13 @@ public final class MaterialTable {
     public static final byte OPAQUE = 1;
     public static final byte TRANSLUCENT = 2;
     public static final byte EMISSIVE_PASS = 3;
+    /**
+     * Листва: для primary-луча прозрачна (видно что за кроной),
+     * для теневого — непрозрачна (крона солнцу почти не просвечивает,
+     * как и в ванильном освещении). Отдельный код, чтобы стекло/вода
+     * остались полутенью 0.5.
+     */
+    public static final byte LEAF = 4;
 
     private MaterialTable() {}
 
@@ -39,6 +46,10 @@ public final class MaterialTable {
         }
         if (st.liquid()) {
             return TRANSLUCENT;
+        }
+        // Листва раньше стекла/травы: у нее свой код тени.
+        if (st.getBlock() instanceof net.minecraft.world.level.block.LeavesBlock) {
+            return LEAF;
         }
         if (!st.isSolidRender()) {
             // Торчащие/плоские блоки: трава, цветы, снег-слой, факелы без света и т.п.
@@ -79,6 +90,6 @@ public final class MaterialTable {
     }
 
     public static void logSelfCheck() {
-        Sunflower.LOGGER.info("[sunflower-rt] material table: air=0 opaque=1 translucent=2 emissive=3");
+        Sunflower.LOGGER.info("[sunflower-rt] material table: air=0 opaque=1 translucent=2 emissive=3 leaf=4");
     }
 }

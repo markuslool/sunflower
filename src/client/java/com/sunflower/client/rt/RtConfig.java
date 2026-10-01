@@ -29,8 +29,12 @@ public final class RtConfig {
     public int rayStride = 2;
     /** Дальность теневого луча, блоков. Рекомендовано 32..96 для GT 650M. */
     public int shadowDistance = 64;
-    /** Макс. шагов DDA на луч. Рекомендовано 32..128. */
-    public int maxSteps = 64;
+    /**
+     * Макс. шагов DDA на луч. Диагональ ест ~1.73 вокселя/блок,
+     * поэтому шагов нужно примерно вдвое больше дистанции, иначе длинные
+     * лучи обрываются раньше препятствия и свет протекает сквозь блоки.
+     */
+    public int maxSteps = 128;
     /** Секций 16x16x16 в очередь вокселей за кадр. Больше = быстрее заливка, но спайки. */
     public int sectionsPerFrame = 6;
 
@@ -81,19 +85,19 @@ public final class RtConfig {
     public void applyPotatoPreset() {
         this.rayStride = 4;
         this.shadowDistance = 32;
-        this.maxSteps = 32;
+        this.maxSteps = 64;
     }
 
     public void applyLowPreset() {
         this.rayStride = 2;
         this.shadowDistance = 64;
-        this.maxSteps = 64;
+        this.maxSteps = 128;
     }
 
     public void applyMediumPreset() {
         this.rayStride = 1;
         this.shadowDistance = 96;
-        this.maxSteps = 96;
+        this.maxSteps = 192;
     }
 
     private void normalized() {

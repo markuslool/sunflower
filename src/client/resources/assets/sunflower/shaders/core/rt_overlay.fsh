@@ -71,7 +71,7 @@ void main() {
     float t = 0.0;
     vec3 nrm = vec3(0.0);
     bool hit = false;
-    for (int i = 0; i < 256 && t <= primaryMax; i++) {
+    for (int i = 0; i < 320 && t <= primaryMax; i++) {
         if (tMax.x < tMax.y && tMax.x < tMax.z) {
             cell.x += stepI.x;
             t = tMax.x;
@@ -103,8 +103,30 @@ void main() {
     }
 
     // Shadow march toward the sun.
-    vec3 start = ro + rd * t + nrm * 0.02 + SunDir * 0.05;
+    // Surfaces facing away from the sun are shadowed by definition (no march needed).
+    float facing = dot(nrm, SunDir);
+    if (facing <= 0.0) {
+        float fb = 1.0 - Params.z;
+        fragColor = vec4(fb, fb, fb, 1.0);
+        return;
+    }
+    // Start outside the hit voxel: bias + unconditionally step once, WITHOUT
+    // sampling the starting cell. Sampling it would read the very voxel we hit
+    // (bias 0.05 < voxel size 1.0 usually stays inside) => eternal self-shadow.
+    // That was the "everything is dark" bug.
+    vec3 start = ro + rd * t + nrm * 0.05 + SunDir * 0.1;
     ddaInit(start, SunDir, cell, stepI, tMax, tDelta);
+    // First step: leave the starting voxel before any sampling.
+    if (tMax.x < tMax.y && tMax.x < tMax.z) {
+        cell.x += stepI.x;
+        tMax.x += tDelta.x;
+    } else if (tMax.y < tMax.z) {
+        cell.y += stepI.y;
+        tMax.y += tDelta.y;
+    } else {
+        cell.z += stepI.z;
+        tMax.z += tDelta.z;
+    }
     float shadowDist = Params.x;
     int maxSteps = int(Params.y);
     float st = 0.0;
@@ -114,10 +136,12 @@ void main() {
             break;
         }
         uint m = voxelAt(cell);
-        if (m == 1u) {
+        if (m == 1u || m == 4u) {
+            // Непрозрачный блок или листва: солнцу не просвечивает.
             occl = 1.0;
             break;
         } else if (m == 2u) {
+            // Стекло/вода/трава: полутень.
             occl += 0.5;
             if (occl >= 1.0) {
                 occl = 1.0;

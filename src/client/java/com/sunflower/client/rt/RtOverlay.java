@@ -223,11 +223,11 @@ public final class RtOverlay {
     }
 
     private static void uploadVoxels(VoxelVolume vol) {
-        byte[] raw = vol.rawBytes();
+        byte[] flat = vol.snapshotFlat();
         try (GpuBufferSlice.MappedView view = voxelBuf.map(false, true)) {
             ByteBuffer buf = view.data();
             buf.position(0);
-            buf.put(raw);
+            buf.put(flat);
         } catch (Exception e) {
             Sunflower.LOGGER.warn("[sunflower-rt] voxel upload failed: {}", e.toString());
         }

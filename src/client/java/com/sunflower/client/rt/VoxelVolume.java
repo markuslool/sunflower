@@ -2,6 +2,7 @@ package com.sunflower.client.rt;
 
 import com.sunflower.Sunflower;
 import java.util.ArrayDeque;
+import java.util.Arrays;
 import java.util.HashSet;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.Level;
@@ -9,36 +10,44 @@ import net.minecraft.world.level.Level;
 /**
  * CPU-сторона воксельного объема для теневого DDA.
  *
- * <p>Раскладка: плотный byte[W*H*D], 1 байт = {@link MaterialTable} код.
- * Начало координат (originX/Y/Z) — минимальный угол бокса в мировых блоках,
- * всегда кратно 16 (выровнено по секциям — так очередь проще).
- * За пределы бокса луч считается ушедшим в небо (тени нет).
+ * <p>Хранение — ПО СЕКЦИЯМ 16x16x16 (как чанки), а не плоским массивом.
+ * Это структурная защита от фантомов: раньше origin сдвигался, а байты
+ * лежали на месте, и весь объем интерпретировался со сдвигом — старые
+ * деревья ехали за игроком. Теперь данные привязаны к координатам секций:
+ * рецентровка лишь перекладывает указатели, сдвиг невозможен в принципе.
  *
- * <p>Почему так для GT 650M: 192x96x192 = ~3.5МБ — влезает даже в 1GB VRAM.
+ * <p>Пустая (null) секция = неизвестна = читается как воздух (fail-open:
+ * лучше лишний свет, чем фантомная тень).
  *
- * <p>Обновление инкрементальное: очередь секций 16x16x16 + бюджет в drain().
- * При сдвиге бокса (recenterSmart) в очередь встают ТОЛЬКО новые секции,
- * перекрытие сохраняется — нет шторма перезаливки на бегу.
+ * <p>Размер: 12x6x12 секций = 192x96x192 блока ≈ 3.5МБ + оверхед ссылок.
  */
 public final class VoxelVolume {
-    /** Дефолт для low-end: 12x6x12 чанков = 192x96x192 блока. */
+    /** Дефолт для low-end: 12x6x12 секций = 192x96x192 блока. */
     public static final int DEFAULT_W = 192;
     public static final int DEFAULT_H = 96;
     public static final int DEFAULT_D = 192;
+    public static final int SX = DEFAULT_W / 16;
+    public static final int SY = DEFAULT_H / 16;
+    public static final int SZ = DEFAULT_D / 16;
+    public static final int SECTION_SIZE = 4096;
 
     /** Секций в боксе: 12*6*12 = 864. */
-    public static final int SECTIONS_TOTAL = (DEFAULT_W / 16) * (DEFAULT_H / 16) * (DEFAULT_D / 16);
+    public static final int SECTIONS_TOTAL = SX * SY * SZ;
 
     private final int w;
     private final int h;
     private final int d;
-    private final byte[] voxels;
 
-    private int originX;
-    private int originY;
-    private int originZ;
+    /** Секция бокса: cells[((sy-baseSy)*SZ + (sz-baseSz))*SX + (sx-baseSx)], null = нет данных. */
+    private byte[][] cells = new byte[SECTIONS_TOTAL][];
+    private int baseSx;
+    private int baseSy;
+    private int baseSz;
     private boolean initialized;
     private volatile boolean uploadDirty = true;
+
+    /** Плоский стейджинг для аплоада на GPU (собирается из секций). */
+    private final byte[] staging;
 
     private final ArrayDeque<Long> queue = new ArrayDeque<>();
     private final HashSet<Long> queued = new HashSet<>();
@@ -52,7 +61,7 @@ public final class VoxelVolume {
         this.w = w;
         this.h = h;
         this.d = d;
-        this.voxels = new byte[w * h * d];
+        this.staging = new byte[w * h * d];
     }
 
     private static long pack(int sx, int sy, int sz) {
@@ -60,7 +69,11 @@ public final class VoxelVolume {
     }
 
     private static int snapDown(int v) {
-        return (v / 16) * 16 - (v < 0 && v % 16 != 0 ? 16 : 0);
+        int q = v / 16;
+        if (v < 0 && v % 16 != 0) {
+            q--;
+        }
+        return q * 16;
     }
 
     private synchronized void enqueue(int sx, int sy, int sz) {
@@ -70,57 +83,60 @@ public final class VoxelVolume {
         }
     }
 
-    private boolean sectionInside(int sx, int sy, int sz, int ox, int oy, int oz) {
-        int x0 = sx * 16;
-        int y0 = sy * 16;
-        int z0 = sz * 16;
-        return x0 + 16 > ox && x0 < ox + w
-                && y0 + 16 > oy && y0 < oy + h
-                && z0 + 16 > oz && z0 < oz + d;
-    }
-
-    private boolean sectionInside(int sx, int sy, int sz) {
-        return sectionInside(sx, sy, sz, originX, originY, originZ);
+    private int cellIndex(int sx, int sy, int sz) {
+        int ix = sx - baseSx;
+        int iy = sy - baseSy;
+        int iz = sz - baseSz;
+        if (ix < 0 || iy < 0 || iz < 0 || ix >= SX || iy >= SY || iz >= SZ) {
+            return -1;
+        }
+        return (iy * SZ + iz) * SX + ix;
     }
 
     /**
-     * Сдвинуть бокс к игроку. Начало всегда кратно 16.
-     * В очередь встают только секции, которых не было в старом боксе.
+     * Сдвинуть бокс к игроку. Данные едут ВМЕСТЕ с боксом (перекладка указателей
+     * по координатам секций), в очередь встают только секции, которых не было.
      */
     public synchronized void recenterSmart(int playerBlockX, int playerBlockY, int playerBlockZ, int minY, int maxY) {
         int nx = snapDown(playerBlockX - w / 2);
         int nz = snapDown(playerBlockZ - d / 2);
         int ny = snapDown(playerBlockY - h / 2);
         ny = Math.max(snapDown(minY), Math.min(snapDown(maxY - h), ny));
-        if (initialized && nx == originX && ny == originY && nz == originZ) {
+        int nbx = nx / 16;
+        int nby = ny / 16;
+        int nbz = nz / 16;
+        if (initialized && nbx == baseSx && nby == baseSy && nbz == baseSz) {
             return;
         }
-        int ox = originX;
-        int oy = originY;
-        int oz = originZ;
-        boolean hadBox = initialized;
-        originX = nx;
-        originY = ny;
-        originZ = nz;
-        initialized = true;
+        byte[][] moved = new byte[SECTIONS_TOTAL][];
         int added = 0;
-        for (int sy = ny / 16; sy * 16 < ny + h; sy++) {
-            for (int sz = nz / 16; sz * 16 < nz + d; sz++) {
-                for (int sx = nx / 16; sx * 16 < nx + w; sx++) {
-                    if (!hadBox || !sectionInside(sx, sy, sz, ox, oy, oz)) {
+        for (int sy = nby; sy < nby + SY; sy++) {
+            for (int sz = nbz; sz < nbz + SZ; sz++) {
+                for (int sx = nbx; sx < nbx + SX; sx++) {
+                    int dst = ((sy - nby) * SZ + (sz - nbz)) * SX + (sx - nbx);
+                    int src = initialized ? cellIndex(sx, sy, sz) : -1;
+                    if (src >= 0) {
+                        moved[dst] = cells[src]; // секция переехала вместе с боксом
+                    } else {
                         enqueue(sx, sy, sz);
                         added++;
                     }
                 }
             }
         }
+        cells = moved;
+        baseSx = nbx;
+        baseSy = nby;
+        baseSz = nbz;
+        initialized = true;
         uploadDirty = true;
-        Sunflower.LOGGER.debug("[sunflower-rt] volume box {},{},{} +{} sections (queue={})", nx, ny, nz, added, queue.size());
+        Sunflower.LOGGER.debug("[sunflower-rt] volume base {},{},{} +{} sections (queue={})",
+                nbx, nby, nbz, added, queue.size());
     }
 
-    /** Пометить секцию грязной (блок поставлен/сломан). */
+    /** Пометить секцию грязной (блок поставлен/сломан). Данные лежат до перепёка — ок. */
     public synchronized void markSectionDirty(int sx, int sy, int sz) {
-        if (!initialized || !sectionInside(sx, sy, sz)) {
+        if (!initialized || cellIndex(sx, sy, sz) < 0) {
             return;
         }
         enqueue(sx, sy, sz);
@@ -149,24 +165,34 @@ public final class VoxelVolume {
     }
 
     private void fillSection(Level level, int sx, int sy, int sz) {
+        int idx = cellIndex(sx, sy, sz);
+        if (idx < 0) {
+            return; // секция уже вне бокса (бокс уехал пока ждала) — пропускаем
+        }
+        byte[] arr = cells[idx];
+        if (arr == null) {
+            arr = new byte[SECTION_SIZE];
+            cells[idx] = arr;
+        }
+        int p = 0;
         for (int ly = 0; ly < 16; ly++) {
             int wy = sy * 16 + ly;
+            boolean outY = level.isOutsideBuildHeight(wy);
             for (int lz = 0; lz < 16; lz++) {
                 int wz = sz * 16 + lz;
                 for (int lx = 0; lx < 16; lx++) {
-                    int wx = sx * 16 + lx;
                     byte mat;
-                    if (level.isOutsideBuildHeight(wy)) {
+                    if (outY) {
                         mat = MaterialTable.AIR;
                     } else {
                         try {
-                            scratch.set(wx, wy, wz);
+                            scratch.set(sx * 16 + lx, wy, wz);
                             mat = MaterialTable.classify(level.getBlockState(scratch));
                         } catch (Exception e) {
                             mat = MaterialTable.AIR;
                         }
                     }
-                    setVoxel(wx, wy, wz, mat);
+                    arr[p++] = mat;
                 }
             }
         }
@@ -177,25 +203,72 @@ public final class VoxelVolume {
         initialized = false;
         queue.clear();
         queued.clear();
-        java.util.Arrays.fill(voxels, (byte) 0);
+        cells = new byte[SECTIONS_TOTAL][];
         uploadDirty = true;
     }
 
     public synchronized void setVoxel(int wx, int wy, int wz, byte mat) {
-        int lx = wx - originX;
-        int ly = wy - originY;
-        int lz = wz - originZ;
-        if (lx < 0 || ly < 0 || lz < 0 || lx >= w || ly >= h || lz >= d) {
+        int sx = Math.floorDiv(wx, 16);
+        int sy = Math.floorDiv(wy, 16);
+        int sz = Math.floorDiv(wz, 16);
+        int idx = cellIndex(sx, sy, sz);
+        if (idx < 0) {
             return;
         }
-        voxels[(ly * d + lz) * w + lx] = mat;
+        byte[] arr = cells[idx];
+        if (arr == null) {
+            arr = new byte[SECTION_SIZE];
+            cells[idx] = arr;
+        }
+        arr[((wy - sy * 16) * 16 + (wz - sz * 16)) * 16 + (wx - sx * 16)] = mat;
     }
 
     public synchronized byte getVoxelLocal(int lx, int ly, int lz) {
-        if (lx < 0 || ly < 0 || lz < 0 || lx >= w || ly >= h || lz >= d) {
+        return getVoxelWorld(originX() + lx, originY() + ly, originZ() + lz);
+    }
+
+    public synchronized byte getVoxelWorld(int wx, int wy, int wz) {
+        int sx = Math.floorDiv(wx, 16);
+        int sy = Math.floorDiv(wy, 16);
+        int sz = Math.floorDiv(wz, 16);
+        int idx = cellIndex(sx, sy, sz);
+        if (idx < 0) {
             return MaterialTable.AIR;
         }
-        return voxels[(ly * d + lz) * w + lx];
+        byte[] arr = cells[idx];
+        if (arr == null) {
+            return MaterialTable.AIR;
+        }
+        return arr[((wy - sy * 16) * 16 + (wz - sz * 16)) * 16 + (wx - sx * 16)];
+    }
+
+    /**
+     * Собрать плоский снимок для GPU: секции по порядку, пустые — нули.
+     * Возвращает внутренний стейджинг (не хранить ссылку, копируется сразу).
+     */
+    public synchronized byte[] snapshotFlat() {
+        int p = 0;
+        // Порядок обязан совпадать с шейдером: ((y*D + z)*W + x), секции 16³.
+        for (int sy = baseSy; sy < baseSy + SY; sy++) {
+            for (int ly = 0; ly < 16; ly++) {
+                for (int sz = baseSz; sz < baseSz + SZ; sz++) {
+                    for (int lz = 0; lz < 16; lz++) {
+                        for (int sx = baseSx; sx < baseSx + SX; sx++) {
+                            int idx = cellIndex(sx, sy, sz);
+                            byte[] arr = idx >= 0 ? cells[idx] : null;
+                            if (arr == null) {
+                                Arrays.fill(staging, p, p + 16, (byte) 0);
+                            } else {
+                                int src = (ly * 16 + lz) * 16;
+                                System.arraycopy(arr, src, staging, p, 16);
+                            }
+                            p += 16;
+                        }
+                    }
+                }
+            }
+        }
+        return staging;
     }
 
     /** Забрать флаг "нужен аплоад на GPU" (полная перезаливка, v1). */
@@ -217,10 +290,6 @@ public final class VoxelVolume {
         return initialized;
     }
 
-    public byte[] rawBytes() {
-        return voxels;
-    }
-
     public int width() {
         return w;
     }
@@ -234,18 +303,18 @@ public final class VoxelVolume {
     }
 
     public int originX() {
-        return originX;
+        return baseSx * 16;
     }
 
     public int originY() {
-        return originY;
+        return baseSy * 16;
     }
 
     public int originZ() {
-        return originZ;
+        return baseSz * 16;
     }
 
     public long bytesSize() {
-        return (long) voxels.length;
+        return (long) staging.length;
     }
 }
