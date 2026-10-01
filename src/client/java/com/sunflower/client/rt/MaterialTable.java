@@ -78,7 +78,10 @@ public final class MaterialTable {
                 || blockId.contains("glow") || blockId.contains("fire")) {
             return EMISSIVE_PASS;
         }
-        if (blockId.contains("leaves") || blockId.contains("glass") || blockId.contains("water")
+        if (blockId.contains("leaves")) {
+            return LEAF;
+        }
+        if (blockId.contains("glass") || blockId.contains("water")
                 || blockId.contains("ice") || blockId.contains("slime") || blockId.contains("honey")) {
             return TRANSLUCENT;
         }

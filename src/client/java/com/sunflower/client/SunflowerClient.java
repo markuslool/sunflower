@@ -49,16 +49,11 @@ public class SunflowerClient implements ClientModInitializer {
 			root.then(ClientCommands.literal("bob").then(ClientCommands.argument("mode", IntegerArgumentType.integer(0, 1)).executes(ctx -> {
 				int mode = IntegerArgumentType.getInteger(ctx, "mode");
 				RtOverlay.setUseBob(mode);
-				ctx.getSource().sendFeedback(Component.literal("§e[Sunflower RT] §fbob=" + mode + " (0 base projection, 1 +view-bob). Walk and compare."));
+				ctx.getSource().sendFeedback(Component.literal("§e[Sunflower RT] §fbob=" + mode + " (1 = с view-bob как террейн ваниллы, 0 = базовая проекция для Sodium без боба). Походи: тени должны стоять."));
 				return 1;
 			})));
 
 			dispatcher.register(root);
 		});
-	}
-
-	/** Текущий экран (в 26.2 живет в {@code mc.gui}). */
-	private static net.minecraft.client.gui.screens.Screen getScreenReflect(Minecraft mc) {
-		return mc.gui.screen();
 	}
 }

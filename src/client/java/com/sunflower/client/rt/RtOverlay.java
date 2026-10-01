@@ -41,8 +41,10 @@ import org.joml.Matrix4f;
  * <p>Известные артефакты v1 (честно):
  * <ul>
  *   <li>Рука/сущности затемняются как фон (их нет в воксельном объеме).</li>
- *   <li>Проекция без view-bob: при ходьбе тени могут ехать на пару пикселей.</li>
- *   <li>Настройка шага луча 2x2/4x4 вступит в v1.1 (coarse-таргет); сейчас full-res.</li>
+ *   <li>Матрица лучей useBob=1 повторяет ваниллу один в один; если террейн рисует
+ *       Sodium без боба — тени плывут в такт шагам, лечится /sunflower bob 0.</li>
+ *   <li>Шаг луча 2x2/4x4 — квантование центра пикселя (ResPad.w); фрагмент всё ещё
+ *       выполняется на пиксель, выигрыш — за счёт когерентности лучей, не 4x/16x.</li>
  * </ul>
  */
 public final class RtOverlay {
@@ -66,16 +68,26 @@ public final class RtOverlay {
     private static volatile double lastSunX;
     private static volatile double lastSunY;
     private static volatile long framesDrawn;
-    private static volatile Level lastLevel;
+    /** Предыдущий уровень для детекта смены мира. WeakReference чтобы не держать ClientLevel в памяти после выхода. */
+    private static volatile java.lang.ref.WeakReference<Level> lastLevelRef;
+    /** Счётчик кадров для троттлинга полных аплоадов 3.5МБ во время активной докачки. */
+    private static volatile long uploadThrottleCounter;
+    /** Диагностика для /sunflower status: сколько секций долито в прошлом кадре. */
+    private static volatile int lastFilled;
+    /** Диагностика: ячеек L2 пересчитано в последнем снапшоте (должно быть мало, не 55296). */
+    private static volatile int lastMipRecomputed;
     /** 0 = тени, 1 = чернить найденные поверхности, 2 = весь экран -50% (проверка пасса). */
     private static volatile int debugMode;
     /**
-     * 0 = лучи по базовой проекции (как Sodium-террейн, предположительно),
-     * 1 = с ванильным view-bob (bobHurt/bobView).
-     * Переключается командой /sunflower bob — какая матрица совпадает с террейном,
-     * та и правильная; статическим анализом не решилось (Sodium хранит свою копию).
+     * 0 = лучи по базовой проекции, 1 = с ванильным view-bob (bobHurt/bobView).
+     * Дефолт 1: доказан байткодом renderLevel 26.2 — ванилла сама считает
+     * levelProj = P*bob и рендерит террейн через (P*bob)*Vrot, миксин повторяет
+     * ту же последовательность один в один. 0 нужен только если террейн рисует
+     * Sodium/шейдер со своей копией матриц без боба — сверяется командой
+     * /sunflower bob на ходу: при правильной матрице тени стоят, при чужой —
+     * плывут в такт шагам. Портально-тошнотный спин не повторяем (редкий кейс).
      */
-    private static volatile int useBob;
+    private static volatile int useBob = 1;
 
     private RtOverlay() {}
 
@@ -116,18 +128,43 @@ public final class RtOverlay {
         return useBob;
     }
 
+    /** Диагностика докачки: секций долито в прошлом кадре. */
+    public static int lastFilled() {
+        return lastFilled;
+    }
+
+    /** Ячеек L2 пересчитано в последнем снапшоте (диагностика инкрементальности). */
+    public static int lastMipRecomputed() {
+        return lastMipRecomputed;
+    }
+
     public static void setUseBob(int mode) {
         useBob = mode != 0 ? 1 : 0;
         Sunflower.LOGGER.warn("[sunflower-rt] useBob = {} ({})", useBob,
-                useBob != 0 ? "с view-bob" : "базовая проекция");
+                useBob != 0 ? "с view-bob (как террейн ваниллы)" : "базовая проекция (для Sodium без боба)");
+        // Персист выбора, чтобы не сбрасывался каждый рестарт.
+        try {
+            RtBoot.config().useBob = useBob;
+            RtBoot.saveConfig();
+        } catch (Exception e) {
+            Sunflower.LOGGER.debug("[sunflower-rt] useBob persist failed: {}", e.toString());
+        }
+    }
+
+    /** Применить значение из конфига без сохранения (при старте). */
+    static void syncBobFromConfig(int mode) {
+        useBob = mode != 0 ? 1 : 0;
     }
 
     private static synchronized void ensureInit() {
         if (ready) {
             return;
         }
-        GpuDevice device = RenderSystem.getDevice();
-        pipeline = RenderPipeline.builder()
+        try {
+            GpuDevice device = RenderSystem.getDevice();
+            // DepthStencilState не задаём намеренно: отсутствие = без depth-теста,
+            // оверлей обязан лечь поверх мира на fullscreen-треугольнике.
+            pipeline = RenderPipeline.builder()
                 .withLocation(Sunflower.id("pipeline/rt_overlay"))
                 .withVertexShader(Sunflower.id("core/rt_overlay"))
                 .withFragmentShader(Sunflower.id("core/rt_overlay"))
@@ -155,6 +192,11 @@ public final class RtOverlay {
         ready = true;
         Sunflower.LOGGER.info("[sunflower-rt] overlay pipeline ready (frameUbo={}B, voxels={}B).",
                 FRAME_SIZE, vol.bytesSize());
+        } catch (Exception e) {
+            ready = false;
+            pipeline = null;
+            Sunflower.LOGGER.warn("[sunflower-rt] overlay init failed, retry next frame: {}", e.toString());
+        }
     }
 
     /**
@@ -172,18 +214,24 @@ public final class RtOverlay {
         Level level = mc.level;
         if (level == null || mc.player == null) {
             skipReason = "no level";
+            lastLevelRef = null;
             return;
         }
         if (!level.dimension().equals(Level.OVERWORLD)) {
             skipReason = "not overworld";
             return;
         }
-        if (lastLevel != level) {
-            lastLevel = level;
+        Level prev = lastLevelRef != null ? lastLevelRef.get() : null;
+        if (prev != level) {
+            lastLevelRef = new java.lang.ref.WeakReference<>(level);
             RtBoot.volume().resetForNewLevel();
             Sunflower.LOGGER.info("[sunflower-rt] new level, volume reset.");
         }
         ensureInit();
+        if (!ready || pipeline == null || frameUbo == null || voxelRing == null) {
+            skipReason = "pipeline init failed";
+            return;
+        }
 
         GameRenderState grs = gameRenderer.gameRenderState();
         CameraRenderState cam = grs.levelRenderState.cameraRenderState;
@@ -204,36 +252,73 @@ public final class RtOverlay {
             return;
         }
 
-        // Воксели: recenter + бюджетная докачка + аплоад.
+        // Воксели: recenter + бюджетная докачка + редкий аплоад.
         VoxelVolume vol = RtBoot.volume();
         Vec3 camPos = cam.pos;
         // Оверворлд v1: фиксированные границы (-64 .. 320). Кастомные измерения — позже.
         vol.recenterSmart((int) Math.floor(camPos.x), (int) Math.floor(camPos.y), (int) Math.floor(camPos.z),
                 -64, 320);
-        int filled = vol.drain(level, Math.max(1, RtBoot.config().sectionsPerFrame));
+        // Адаптивный бюджет: базовый из конфига + догоняющий при bulk-правках (/fill):
+        // большую очередь разбираем ~за 30 кадров без вечных спайков (кап 24/кадр).
+        RtConfig cfg = RtBoot.config();
+        int baseBudget = Math.max(1, cfg.sectionsPerFrame);
+        int catchUp = vol.queuedSections() / 30;
+        int budget = Math.min(24, Math.max(baseBudget, catchUp));
+        // Секция игрока — приоритет №1 в очереди докачки: после /fill или загрузки
+        // чанка именно под ногами воксели обновляются первыми.
+        int playerSec = (int) Math.floor(camPos.x) >> 4;
+        int filled = vol.drain(level, budget, playerSec);
+        lastFilled = filled;
+
+        // Аплоад 3.5МБ — САМАЯ дорогая операция кадра (memcpy + fence на Kepler).
+        // Раньше он делался каждый кадр, пока очередь не пуста, и кадр проседал ->
+        // "мерцает при беге". Теперь: не чаще раза в 2 кадра в покое и раз в 6
+        // при большой очереди (плюс сам снапшот считаем не чаще, чем аплоад).
         if (vol.consumeUploadDirty()) {
-            uploadVoxels(vol);
+            uploadThrottleCounter++;
+            // Сдвиг базы НЕ форсируем аплоад: 3.5МБ + fence на каждый сдвиг = жесткая
+            // просадка ("все дергается"). В uniform идет uploadedOrigin — реально
+            // залитая база, поэтому кадр всегда согласован; просто после сдвига
+            // пара секунд видно границу старого бокса, и она уезжает сама.
+            int minGap = vol.queuedSections() > 100 ? 6 : 2;
+            if (uploadThrottleCounter % minGap == 1) {
+                uploadVoxels(vol);
+            }
+            // Флаг НЕ сбрасываем здесь: сбросит сам uploadVoxels после успеха.
         }
 
         // Кадр: inv(P*V), камера, солнце, бокс, параметры.
         // Шагов принудительно >= 2x дистанции: диагональ ест ~1.73 вокселя/блок,
         // иначе длинные лучи обрываются раньше препятствия и свет протекает.
         // (Защита от старого конфига, где maxSteps мог остаться 64 при dist 64.)
-        RtConfig cfg = RtBoot.config();
-        int effSteps = Math.max(cfg.maxSteps, cfg.shadowDistance * 2);
+        int effSteps = RtBoot.effectiveSteps(cfg);
+        // До первого успешного аплоада в GPU нет валидной базы объема — рисовать
+        // нечем, иначе шейдер читал бы нули с Origin=(0,0,0).
+        if (!vol.uploadedOriginValid()) {
+            skipReason = "waiting first voxel upload";
+            return;
+        }
         Matrix4f invVp = new Matrix4f(levelProj).mul(cam.viewRotationMatrix).invert();
+        // gl_FragCoord — в пикселях текущего таргета: берём размер mainRenderTarget,
+        // windowRenderState может отличаться при GUI-scale/render-scale (иначе лучи едут).
         int fw = grs.windowRenderState.width;
         int fh = grs.windowRenderState.height;
+        try {
+            fw = gameRenderer.mainRenderTarget().width;
+            fh = gameRenderer.mainRenderTarget().height;
+        } catch (Exception ignored) {
+            // fallback на windowRenderState выше
+        }
         GpuBuffer frame = frameUbo.currentBuffer();
         try (GpuBufferSlice.MappedView view = frame.map(false, true)) {
             Std140Builder.intoBuffer(view.data())
                     .putMat4f(invVp)
                     .putVec3((float) camPos.x, (float) camPos.y, (float) camPos.z)
                     .putVec3((float) sunX, (float) sunY, 0.0F)
-                    .putIVec3(vol.originX(), vol.originY(), vol.originZ())
+                    .putIVec3(vol.uploadedOriginX(), vol.uploadedOriginY(), vol.uploadedOriginZ())
                     .putIVec3(vol.width(), vol.height(), vol.depth())
                     .putVec4((float) cfg.shadowDistance, (float) effSteps, strength, 160.0F)
-                    .putVec4((float) fw, (float) fh, (float) debugMode, 0.0F);
+                    .putVec4((float) fw, (float) fh, (float) debugMode, (float) cfg.rayStride);
         }
 
         GpuDevice device = RenderSystem.getDevice();
@@ -254,11 +339,21 @@ public final class RtOverlay {
 
     private static void uploadVoxels(VoxelVolume vol) {
         byte[] flat = vol.snapshotFlat();
-        voxelRing.rotate();
-        try (GpuBufferSlice.MappedView view = voxelRing.currentBuffer().map(false, true)) {
-            ByteBuffer buf = view.data();
-            buf.position(0);
-            buf.put(flat);
+        lastMipRecomputed = vol.mipRecomputedCount();
+        try {
+            voxelRing.rotate();
+            try (GpuBufferSlice.MappedView view = voxelRing.currentBuffer().map(false, true)) {
+                ByteBuffer buf = view.data();
+                buf.position(0);
+                if (buf.remaining() < flat.length) {
+                    Sunflower.LOGGER.warn("[sunflower-rt] voxel upload skipped: mapped remaining={} < flat={}",
+                            buf.remaining(), flat.length);
+                    return;
+                }
+                buf.put(flat);
+            }
+            // Флаг гасим ТОЛЬКО здесь: если map/put упал, данные докачаются позже.
+            vol.markUploaded();
         } catch (Exception e) {
             Sunflower.LOGGER.warn("[sunflower-rt] voxel upload failed: {}", e.toString());
         }

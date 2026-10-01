@@ -57,19 +57,23 @@ public final class GpuBridge {
         }
 
         // Путь 2: options.txt preferredGraphicsBackend (работает и до создания девайса).
+        // Парсинг толерантен к регистру/пробелам: ищем ключ и значение отдельно.
         try {
             Minecraft mc = Minecraft.getInstance();
             if (mc != null && mc.gameDirectory != null) {
                 java.nio.file.Path options = mc.gameDirectory.toPath().resolve("options.txt");
                 if (java.nio.file.Files.isRegularFile(options)) {
-                    String text = java.nio.file.Files.readString(options);
-                    if (text.contains("preferredGraphicsBackend:\"vulkan\"")
-                            || text.contains("preferredGraphicsBackend:vulkan")) {
-                        return new BackendInfo(BackendKind.VULKAN, "vulkan", "options.txt");
-                    }
-                    if (text.contains("preferredGraphicsBackend:\"opengl\"")
-                            || text.contains("preferredGraphicsBackend:opengl")) {
-                        return new BackendInfo(BackendKind.OPENGL, "opengl", "options.txt");
+                    String text = java.nio.file.Files.readString(options).toLowerCase(java.util.Locale.ROOT);
+                    // Ключ может быть записан как preferredGraphicsBackend:"vulkan", ...:vulkan, ... : "Vulkan" и т.п.
+                    int key = text.indexOf("preferredgraphicsbackend");
+                    if (key >= 0) {
+                        String tail = text.substring(key, Math.min(text.length(), key + 64));
+                        if (tail.contains("vulkan")) {
+                            return new BackendInfo(BackendKind.VULKAN, "vulkan", "options.txt");
+                        }
+                        if (tail.contains("opengl") || tail.matches("(?s).*\\bgl\\b.*")) {
+                            return new BackendInfo(BackendKind.OPENGL, "opengl", "options.txt");
+                        }
                     }
                 }
             }
@@ -81,18 +85,24 @@ public final class GpuBridge {
     }
 
     /**
-     * Строгое сравнение — ТОЛЬКО equals. Никаких contains: строка "LWJGL version ..."
-     * содержит подстроку "gl", и contains-классификатор врал "OpenGL" на Vulkan-системе.
+     * Сравнение по префиксу, а не строго equals: backendName может прийти с суффиксом
+     * драйвера ("Vulkan (NVIDIA ...)"), а строгое equals роняло такие в UNKNOWN.
+     * Явно отбрасываем "lwjgl..." (там есть подстрока "gl", был такой баг с contains).
      */
     private static BackendInfo classifyStrict(String rawName, String via) {
         if (rawName == null) {
             return new BackendInfo(BackendKind.UNKNOWN, "null", via);
         }
-        String norm = rawName.trim();
-        if (norm.equalsIgnoreCase("vulkan")) {
+        String norm = rawName.trim().toLowerCase(java.util.Locale.ROOT);
+        if (norm.startsWith("lwjgl")) {
+            return new BackendInfo(BackendKind.UNKNOWN, rawName, via + " (lwjgl, not a backend)");
+        }
+        if (norm.equals("vulkan") || norm.startsWith("vulkan ") || norm.startsWith("vulkan(")
+                || norm.startsWith("vulkan-") || norm.startsWith("vulkan/")) {
             return new BackendInfo(BackendKind.VULKAN, rawName, via);
         }
-        if (norm.equalsIgnoreCase("opengl") || norm.equalsIgnoreCase("gl")) {
+        if (norm.equals("opengl") || norm.equals("gl") || norm.startsWith("opengl ")
+                || norm.startsWith("opengl(") || norm.startsWith("gl ") || norm.startsWith("gl(")) {
             return new BackendInfo(BackendKind.OPENGL, rawName, via);
         }
         return new BackendInfo(BackendKind.UNKNOWN, rawName, via);

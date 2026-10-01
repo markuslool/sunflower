@@ -24,19 +24,24 @@ public final class RtConfig {
     private static final String FILE_NAME = "sunflower-rt.json";
 
     /** Включен ли RT-пасс вообще. */
-    public boolean enabled = true;
+    public volatile boolean enabled = true;
     /** 1, 2 или 4. Другие значения нормализуются в load()/setRayStride(). */
-    public int rayStride = 2;
+    public volatile int rayStride = 2;
     /** Дальность теневого луча, блоков. Рекомендовано 32..96 для GT 650M. */
-    public int shadowDistance = 64;
+    public volatile int shadowDistance = 64;
     /**
      * Макс. шагов DDA на луч. Диагональ ест ~1.73 вокселя/блок,
      * поэтому шагов нужно примерно вдвое больше дистанции, иначе длинные
      * лучи обрываются раньше препятствия и свет протекает сквозь блоки.
      */
-    public int maxSteps = 128;
+    public volatile int maxSteps = 128;
     /** Секций 16x16x16 в очередь вокселей за кадр. Больше = быстрее заливка, но спайки. */
-    public int sectionsPerFrame = 6;
+    public volatile int sectionsPerFrame = 6;
+    /**
+     * Матрица лучей: 1 = с view-bob (как террейн ваниллы, дефолт),
+     * 0 = базовая проекция (если террейн рисует Sodium без боба и тени плывут).
+     */
+    public volatile int useBob = 1;
 
     private RtConfig() {}
 
@@ -104,6 +109,7 @@ public final class RtConfig {
         setRayStride(rayStride);
         shadowDistance = Math.max(16, Math.min(160, shadowDistance));
         maxSteps = Math.max(16, Math.min(256, maxSteps));
+        useBob = useBob != 0 ? 1 : 0;
     }
 
     private static Path file() {

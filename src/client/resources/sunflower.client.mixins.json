@@ -5,7 +5,8 @@
 	"client": [
 		"SunflowerBackendMixin",
 		"GameRendererMixin",
-		"ClientLevelMixin"
+		"LevelChunkMixin",
+		"LevelChunkPacketMixin"
 	],
 	"injectors": {
 		"defaultRequire": 1

@@ -3,6 +3,7 @@ package com.sunflower.client;
 import com.sunflower.Sunflower;
 import com.sunflower.client.rt.RtBoot;
 import com.sunflower.client.rt.RtConfig;
+import com.sunflower.client.rt.RtOverlay;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.screens.Screen;
@@ -22,7 +23,7 @@ public final class RtSettingsScreen extends Screen {
     private final Screen parent;
 
     public RtSettingsScreen(Screen parent) {
-        super(Component.literal("Sunflower RT v1 full-res (stride 2x2/4x4 — в v1.1)"));
+        super(Component.literal("Sunflower RT v1 (шаг луча 1x1/2x2/4x4 — активен)"));
         this.parent = parent;
     }
 
@@ -118,6 +119,14 @@ public final class RtSettingsScreen extends Screen {
         y += step;
 
         addRenderableWidget(Button.builder(Component.literal(
+                RtOverlay.useBob() != 0 ? "Лучи: с view-bob (как террейн)" : "Лучи: базовая проекция (Sodium)"),
+                b -> {
+                    RtOverlay.setUseBob(RtOverlay.useBob() != 0 ? 0 : 1);
+                    rebuildWidgets();
+                }).pos(cx, y).size(260, 20).build());
+        y += step;
+
+        addRenderableWidget(Button.builder(Component.literal(
                 RtBoot.isVulkanActive() ? "Бэкенд: Vulkan OK (нажми чтобы перепроверить)" : "Бэкенд: НЕ Vulkan — RT выкл (нажми чтобы перепроверить)"),
                 b -> {
                     RtBoot.refreshBackendState();
@@ -132,6 +141,6 @@ public final class RtSettingsScreen extends Screen {
     @Override
     public void onClose() {
         RtBoot.saveConfig();
-        Minecraft.getInstance().gui.setScreen(parent);
+        RtSettingsScreen.closeTo(parent);
     }
 }
