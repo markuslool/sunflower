@@ -1,0 +1,38 @@
+{
+	"schemaVersion": 1,
+	"id": "sunflower",
+	"version": "${version}",
+	"name": "Sunflower",
+	"description": "Voxel RT (3D DDA) sun shadows for low-end PCs. Requires vanilla Vulkan backend of 26.2, no OpenGL fallback.",
+	"authors": [
+		"Me!"
+	],
+	"contact": {
+		"homepage": "https://fabricmc.net/",
+		"sources": "https://github.com/FabricMC/fabric-example-mod"
+	},
+	"license": "CC0-1.0",
+	"icon": "assets/sunflower/icon.png",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"com.sunflower.Sunflower"
+		],
+		"client": [
+			"com.sunflower.client.SunflowerClient"
+		]
+	},
+	"mixins": [
+		"sunflower.mixins.json",
+		{
+			"config": "sunflower.client.mixins.json",
+			"environment": "client"
+		}
+	],
+	"depends": {
+		"fabricloader": ">=0.19.5",
+		"minecraft": "~26.2",
+		"java": ">=25",
+		"fabric-api": "*"
+	}
+}

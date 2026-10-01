@@ -1,0 +1,16 @@
+{
+	"required": true,
+	"package": "com.sunflower.client.mixin",
+	"compatibilityLevel": "JAVA_25",
+	"client": [
+		"SunflowerBackendMixin",
+		"GameRendererMixin",
+		"ClientLevelMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	},
+	"overwrites": {
+		"requireAnnotations": true
+	}
+}
