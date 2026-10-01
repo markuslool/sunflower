@@ -51,7 +51,14 @@ public final class RtOverlay {
 
     private static RenderPipeline pipeline;
     private static MappableRingBuffer frameUbo;
-    private static GpuBuffer voxelBuf;
+    /**
+     * Воксели в КОЛЬЦЕ на 3 кадра (как ванильный Cloud UTB: тот же usage 258).
+     * Одиночный буфер здесь — гонка: CPU пишет следующий кадр, пока GPU читает
+     * текущий (рваные данные -> мерцание/тряска теней на ходу). Кольцо убирает
+     * ее структурно: пишем всегда в свободный слот, читаем записанный.
+     * rotate() — ТОЛЬКО в кадре аплоада, перед записью (паттерн CloudRenderer).
+     */
+    private static MappableRingBuffer voxelRing;
     private static GpuBuffer triBuf;
     private static volatile boolean ready;
     private static volatile String skipReason = "not initialized";
@@ -136,8 +143,7 @@ public final class RtOverlay {
                 .build();
         frameUbo = new MappableRingBuffer(() -> "Sunflower RT frame", 130, FRAME_SIZE);
         VoxelVolume vol = RtBoot.volume();
-        voxelBuf = device.createBuffer(() -> "Sunflower RT voxels",
-                GpuBuffer.USAGE_UNIFORM_TEXEL_BUFFER | GpuBuffer.USAGE_MAP_WRITE, vol.bytesSize());
+        voxelRing = new MappableRingBuffer(() -> "Sunflower RT voxels", 258, (int) vol.bytesSize());
         triBuf = device.createBuffer(() -> "Sunflower RT triangle",
                 GpuBuffer.USAGE_VERTEX | GpuBuffer.USAGE_MAP_WRITE, 36L);
         try (GpuBufferSlice.MappedView view = triBuf.map(false, true)) {
@@ -237,7 +243,7 @@ public final class RtOverlay {
                 gameRenderer.mainRenderTarget().getColorTextureView(), Optional.empty())) {
             pass.setPipeline(pipeline);
             pass.setUniform("RtFrame", frame);
-            pass.setUniform("Voxels", voxelBuf);
+            pass.setUniform("Voxels", voxelRing.currentBuffer());
             pass.setVertexBuffer(0, triSlice);
             pass.draw(3, 1, 0, 0);
         }
@@ -248,7 +254,8 @@ public final class RtOverlay {
 
     private static void uploadVoxels(VoxelVolume vol) {
         byte[] flat = vol.snapshotFlat();
-        try (GpuBufferSlice.MappedView view = voxelBuf.map(false, true)) {
+        voxelRing.rotate();
+        try (GpuBufferSlice.MappedView view = voxelRing.currentBuffer().map(false, true)) {
             ByteBuffer buf = view.data();
             buf.position(0);
             buf.put(flat);
