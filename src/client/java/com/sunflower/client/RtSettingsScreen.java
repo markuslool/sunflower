@@ -118,6 +118,47 @@ public final class RtSettingsScreen extends Screen {
         }).pos(cx, y).size(260, 20).build());
         y += step;
 
+        addRenderableWidget(Button.builder(
+                Component.literal("Сила теней: " + Math.round(cfg.shadowStrength * 100.0F) + "%"),
+                b -> {
+                    float v = cfg.shadowStrength;
+                    if (v >= 0.99F) {
+                        v = 0.20F;
+                    } else if (v < 0.30F) {
+                        v = 0.35F;
+                    } else if (v < 0.40F) {
+                        v = 0.50F;
+                    } else if (v < 0.55F) {
+                        v = 0.65F;
+                    } else if (v < 0.70F) {
+                        v = 0.80F;
+                    } else {
+                        v = 1.00F;
+                    }
+                    cfg.shadowStrength = v;
+                    RtBoot.saveConfig();
+                    rebuildWidgets();
+                }).pos(cx, y).size(260, 20).build());
+        y += step;
+
+        addRenderableWidget(Button.builder(
+                Component.literal("Мягкость: " + softLabel(cfg.softShadows)),
+                b -> {
+                    cfg.softShadows = cfg.softShadows >= 2 ? 0 : cfg.softShadows + 1;
+                    RtBoot.saveConfig();
+                    rebuildWidgets();
+                }).pos(cx, y).size(260, 20).build());
+        y += step;
+
+        addRenderableWidget(Button.builder(
+                Component.literal(cfg.cloudShadows ? "Облачные тени: ВКЛ" : "Облачные тени: ВЫКЛ"),
+                b -> {
+                    cfg.cloudShadows = !cfg.cloudShadows;
+                    RtBoot.saveConfig();
+                    rebuildWidgets();
+                }).pos(cx, y).size(260, 20).build());
+        y += step;
+
         addRenderableWidget(Button.builder(Component.literal(
                 RtOverlay.useBob() != 0 ? "Лучи: с view-bob (как террейн)" : "Лучи: базовая проекция (Sodium)"),
                 b -> {
@@ -142,5 +183,14 @@ public final class RtSettingsScreen extends Screen {
     public void onClose() {
         RtBoot.saveConfig();
         RtSettingsScreen.closeTo(parent);
+    }
+
+    /** Подпись режима мягкости: 1/4/8 тапов по диску солнца. */
+    private static String softLabel(int mode) {
+        return switch (mode) {
+            case 0 -> "жесткие (1 тап, быстро)";
+            case 1 -> "мягкие (4 тапа)";
+            default -> "мягкие (8 тапов, тяжело)";
+        };
     }
 }

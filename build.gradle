@@ -4,6 +4,7 @@ plugins {
 }
 
 repositories {
+	mavenCentral()
 	// Add repositories to retrieve artifacts from in here.
 	// You should only use this when depending on other mods because
 	// Loom adds the essential maven repositories to download Minecraft and libraries from automatically.
@@ -29,6 +30,74 @@ dependencies {
 
 	// Fabric API. This is technically optional, but you probably want it anyway.
 	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+
+	// Юнит-тесты на чистую математику раскладки/гистерезиса (SectionKeys, VolumeLayout, BoxHysteresis).
+	// Именно там уже была реальная дыра с битой маской координат, которую без тестов не поймать.
+	testImplementation platform("org.junit:junit-bom:5.11.4")
+	testImplementation "org.junit.jupiter:junit-jupiter"
+	testRuntimeOnly "org.junit.platform:junit-platform-launcher"
+}
+
+test {
+	useJUnitPlatform()
+	testLogging {
+		events "passed", "failed", "skipped"
+	}
+}
+
+// Проверка GLSL реальным компилятором, если он есть в системе (Vulkan SDK).
+// Расхождение CPU/GLSL не даёт ошибки компиляции Java — шейдер молча рисует мусор,
+// поэтому такую проверку стоит держать в сборке. Без компилятора таска просто пропускается.
+tasks.register("validateShaders") {
+	description = "Компилирует core-шейдеры glslangValidator (если установлен)."
+	group = "verification"
+	// Список файлов фиксируем на этапе конфигурации — иначе configuration cache
+	// ругается на обращение к script object внутри doLast.
+	def shaderFiles = fileTree("src/client/resources/assets/sunflower/shaders/core") {
+		include "**/*.fsh", "**/*.vsh"
+	}.files.collect { it.absolutePath }
+	doLast {
+		def names = ["glslangValidator.exe", "glslc.exe", "glslangValidator", "glslc"]
+		def candidates = []
+		// 1) Vulkan SDK в Program Files / C:\VulkanSDK
+		def sdkRoots = ["C:/VulkanSDK", "${System.getProperty('user.home')}/VulkanSDK"]
+		sdkRoots.each { root ->
+			def dir = new File(root)
+			if (dir.directory) {
+				dir.listFiles()?.sort { it.name }?.each { v ->
+					names.each { n -> candidates.add(new File(v, "Bin/${n}")) }
+				}
+			}
+		}
+		// 2) просто PATH
+		def probe = (System.getProperty('os.name').toLowerCase().contains('win') ? "where.exe" : "which")
+				.execute()
+		def pout = new StringBuilder(), perr = new StringBuilder()
+		probe.consumeProcessOutput(pout, perr)
+		probe.waitFor()
+		pout.toString().readLines().each { line ->
+			def p = line.trim()
+			if (p) { candidates.add(new File(p)) }
+		}
+		def exe = candidates.find { it.isFile() && it.canExecute() }
+		if (exe == null) {
+			logger.lifecycle("[sunflower] glslangValidator не найден — проверка шейдеров пропущена")
+			return
+		}
+		logger.lifecycle("[sunflower] GLSL-компилятор: ${exe}")
+		shaderFiles.each { path ->
+			def name = new File(path).name
+			def stage = name.endsWith(".vsh") ? "vert" : "frag"
+			def proc = [exe.absolutePath, "-S", stage, path].execute()
+			def out = new StringBuilder(), err = new StringBuilder()
+			proc.consumeProcessOutput(out, err)
+			proc.waitFor()
+			if (proc.exitValue() != 0) {
+				throw new GradleException("GLSL ошибка в ${name}:\n${out}\n${err}")
+			}
+			logger.lifecycle("[sunflower] GLSL OK: ${name}")
+		}
+	}
 }
 
 processResources {

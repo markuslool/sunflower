@@ -1,6 +1,8 @@
 package com.sunflower.client.rt;
 
+import com.mojang.blaze3d.buffers.GpuBufferSlice;
 import com.sunflower.Sunflower;
+import java.nio.ByteBuffer;
 import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -173,51 +175,131 @@ public final class VoxelVolume {
         Arrays.fill(dirtyRows, 0L);
     }
 
+    /** Байт последней успешной частичной загрузки (диагностика: 0 = аплоад не нужен). */
+    private int lastUploadedBytes;
+
+    /** Сколько строк Y ждут загрузки на GPU (должно быть 0 в устоявшемся кадре). */
+    public synchronized int pendingDirtyRows() {
+        int n = 0;
+        for (int i = 0; i < h; i++) {
+            if ((dirtyRows[i >> 6] & (1L << (i & 63))) != 0) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    /** Сколько байт ушло в GPU в последнем аплоаде. */
+    public synchronized int lastUploadedBytes() {
+        return lastUploadedBytes;
+    }
+
+    /**
+     * Диагностика coarse-уровня: сколько ячеек L2 в staging считает "не пусто".
+     *
+     * <p>Если 0 — Hi-DDA выключен по факту: coarseFind() сразу возвращает -1,
+     * primary-марш не находит поверхность и тени не рисуются вовсе. Именно так
+     * выглядел баг с взаимной блокировкой флага mipUploadPending.
+     */
+    public synchronized int nonEmptyMipCells() {
+        int n = 0;
+        for (int i = 0; i < mipCells; i++) {
+            if (staging[layout.mipOffset + i] != 0) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    /**
+     * true — следующий {@link #uploadDirtyRange} перезапишет буфер целиком,
+     * поэтому device-copy предыдущего слота можно пропустить.
+     *
+     * <p>Это важно для инварианта кольца: каждый слот хранит полную актуальную
+     * картинку, а копирование вперёд переносит накопленные патчи. Если патч
+     * перезаписывает всё, копирование просто лишнее.
+     */
+    public synchronized boolean nextUploadIsFull() {
+        int[] r = dirtyRowRange();
+        if (r != null && (r[1] - r[0] + 1) > h / FULL_UPLOAD_ROW_FRACTION) {
+            return true;
+        }
+        return r != null && mipUploadPending && r[0] == 0;
+    }
+
     /**
      * Частичная загрузка на GPU. Возвращает true, если данные залиты.
      *
-     * <p>Заливается ОДИН непрерывный срез: строки [lo..hi] плюс хвост L2, если
-     * он грязный. Никаких 3.5 МБ в покое — обычно это десятки килобайт.
+     * <p>Заливается ОДИН непрерывный срез: строки [lo..hi], а если пересобрался L2 —
+     * то и его хвост сразу (в буфере он идёт вплотную за L0).
+     *
+     * <p>ВАЖНО: L2 пересобирается ЗДЕСЬ ВСЕГДА, а не по флагу. Раньше флаг ставился
+     * внутри buildMips(), а buildMips() вызывался только если флаг уже стоял, — mutual
+     * deadlock. В итоге coarse-уровень навсегда оставался нулевым ("всё пусто"),
+     * coarseFind() сразу возвращал -1, и тени то пропадали, то мигали при подгрузке
+     * новых территорий.
      */
-    public boolean uploadDirtyRange(GpuBufferSlice target) {
+    public boolean uploadDirtyRange(com.mojang.blaze3d.buffers.GpuBuffer target) {
         int[] range = dirtyRowRange();
-        boolean mipDirtyNow = mipUploadPending;
-        if (range == null && !mipDirtyNow) {
+        int lo = 0;
+        int hi = -1;
+        boolean hasRows = false;
+        if (range != null) {
+            if ((range[1] - range[0] + 1) <= h / FULL_UPLOAD_ROW_FRACTION) {
+                lo = range[0];
+                hi = range[1];
+            } else {
+                // Грязного слишком много (или это первый кадр) — дешевле один большой
+                // непрерывный срез, чем раздутый диапазон строк.
+                lo = 0;
+                hi = h - 1;
+            }
+            snapshotRows(lo, hi);
+            hasRows = true;
+        }
+
+        int mipCount = buildMips();
+        if (mipCount > 0) {
+            mipUploadPending = true;
+        }
+        if (!hasRows && !mipUploadPending) {
+            lastUploadedBytes = 0;
             return true;
         }
-        int lo;
-        int hi;
-        if (range == null || (hi - lo + 1) > h / FULL_UPLOAD_ROW_FRACTION) {
-            // Грязного слишком много — дешевле один большой срез, чем раздутый диапазон.
-            lo = 0;
-            hi = h - 1;
+
+        final int offset;
+        final int length;
+        if (!hasRows) {
+            offset = layout.mipOffset;
+            length = layout.mipCells;
         } else {
-            lo = range[0];
-            hi = range[1];
+            offset = layout.rowOffset(lo);
+            length = mipUploadPending ? layout.totalBytes - offset : layout.rowOffset(hi) + layout.rowBytes - offset;
         }
-        snapshotRows(lo, hi);
-        int offset = layout.rowOffset(lo);
-        int length = layout.rowOffset(hi) + layout.rowBytes - offset;
-        if (mipDirtyNow) {
-            length = layout.totalBytes - offset; // L2 идёт сразу за L0, буфер непрерывен
-        }
-        try (GpuBufferSlice.MappedView view = target.slice(offset, length).map(false, true)) {
+        try (GpuBufferSlice.MappedView view = new GpuBufferSlice(target, 0, target.size())
+                .slice(offset, length)
+                .map(false, true)) {
             ByteBuffer buf = view.data();
             buf.position(0);
             if (buf.remaining() < length) {
+                markAllMipsDirty();
                 return false;
             }
             buf.put(staging, offset, length);
         } catch (Exception e) {
+            // Пересборка уже сбросила флаги mipDirty — возвращаем их, иначе
+            // сорванная загрузка молча оставила бы шейдер со старым L2.
+            markAllMipsDirty();
             Sunflower.LOGGER.warn("[sunflower-rt] partial voxel upload failed: {}", e.toString());
             return false;
         }
-        for (int y = lo; y <= hi; y++) {
-            clearRowDirty(y);
+        if (hasRows) {
+            for (int y = lo; y <= hi; y++) {
+                clearRowDirty(y);
+            }
         }
-        if (mipDirtyNow) {
-            mipUploadPending = false;
-        }
+        mipUploadPending = false;
+        lastUploadedBytes = length;
         return true;
     }
 
@@ -281,10 +363,6 @@ public final class VoxelVolume {
         return SectionKeys.unpackZ(key);
     }
 
-    private static int snapDown(int v) {
-        return BoxHysteresis.snapDown(v, 16);
-    }
-
     private synchronized void enqueue(int sx, int sy, int sz) {
         long key = pack(sx, sy, sz);
         if (queued.add(key)) {
@@ -316,7 +394,7 @@ public final class VoxelVolume {
         }
         int nx = BoxHysteresis.centeredBase(playerBlockX, w);
         int nz = BoxHysteresis.centeredBase(playerBlockZ, d);
-        int ny = BoxHysteresis.clampBaseY(BoxHysteresis.snapDown(playerBlockY - h / 2), h, minY, maxY);
+        int ny = BoxHysteresis.clampBaseY(BoxHysteresis.snapDownSection(playerBlockY - h / 2), h, minY, maxY);
         int nbx = nx / 16;
         int nby = ny / 16;
         int nbz = nz / 16;
@@ -504,8 +582,19 @@ public final class VoxelVolume {
             return; // секция уже вне бокса (бокс уехал пока ждала) — пропускаем
         }
         cells[idx] = buildSection(level, sx, sy, sz);
-        markRowDirty((sy - baseSy) * 16); // весь вертикальный срез секции
+        // Секция высотой 16 блоков = 16 строк staging. Пометить только одну строку
+        // нельзя: 15 строк остались бы в GPU старыми и давали бы пятнистые
+        // фантомные тени (проверено на скриншоте — «леопардовые» чёрные пятна).
+        markSectionRowsDirty(sy - baseSy);
         markMipsDirtyForSection(sx, sy, sz);
+    }
+
+    /** Пометить грязными все 16 строк секции по локальной координате секции. */
+    private void markSectionRowsDirty(int syLocal) {
+        int first = layout.sectionFirstRow(syLocal);
+        for (int i = 0; i < 16; i++) {
+            markRowDirty(first + i);
+        }
     }
 
     /** Прочитать 16^3 секцию из мира и сразу посчитать её occupancy-класс. */
@@ -553,6 +642,10 @@ public final class VoxelVolume {
         cells = new SectionData[sectionsTotal];
         markAllMipsDirty();
         uploadDirty = true;
+        clearAllRowsDirty();
+        for (int y = 0; y < h; y++) {
+            markRowDirty(y);
+        }
         uploadedOriginValid = false; // старые данные GPU больше не соответствуют миру
     }
 
@@ -633,6 +726,7 @@ public final class VoxelVolume {
      */
     public synchronized byte[] snapshotFlat() {
         snapshotRows(0, h - 1);
+        buildMips();
         return staging;
     }
 
@@ -673,7 +767,6 @@ public final class VoxelVolume {
                 }
             }
         }
-        buildMips();
     }
 
     /** Консервативный occupancy-код mip-пирамиды: пусто только если все дети 0/3. */
@@ -696,7 +789,8 @@ public final class VoxelVolume {
      * 3.5M чтений на каждый снапшот, что на GT 650M съедало кадр и давало
      * "мерцание при беге"; теперь обычно пересчитываются десятки ячеек.
      */
-    private void buildMips() {
+    /** Пересобрать грязные ячейки L2, вернуть число пересчитанных. */
+    private int buildMips() {
         int anyDirty = 0;
         for (int my = 0; my < mipH; my++) {
             for (int mz = 0; mz < mipD; mz++) {
@@ -718,6 +812,7 @@ public final class VoxelVolume {
             }
         }
         mipRecomputed = anyDirty;
+        return anyDirty;
     }
 
     /**

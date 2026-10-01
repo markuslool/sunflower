@@ -133,11 +133,17 @@ public final class RtBoot {
         }
         out.add("enabled=" + config.enabled + " stride=" + config.rayStride + "x" + config.rayStride
                 + " dist=" + config.shadowDistance + " steps=" + config.maxSteps + " (eff=" + effectiveSteps(config) + ")");
+        out.add("strength=" + String.format("%.2f", config.shadowStrength)
+                + " soft=" + (config.softShadows == 0 ? "1tap" : config.softShadows == 1 ? "4tap" : "8tap")
+                + " cloud=" + config.cloudShadows);
         out.add("overlay ready=" + RtOverlay.isReady() + " frames=" + RtOverlay.framesDrawn()
                 + " debug=" + RtOverlay.debugMode() + " bob=" + RtOverlay.useBob()
                 + (RtOverlay.useBob() != 0 ? " (+view-bob, как террейн)" : " (базовая, для Sodium)")
                 + " state=" + RtOverlay.skipReason());
-        out.add("sodium=" + isSodiumLoaded() + " (если true и тени плывут — попробуй /sunflower bob 0)");
+        out.add("sodium=" + isSodiumLoaded()
+                + (RtOverlay.useBob() != 0
+                        ? " (bob включен — матрица как у ваниллы)"
+                        : " (bob ВЫКЛ: тени будут ездить при ходьбе, включи /sunflower bob 1)"));
         out.add("sun=(" + String.format("%.2f", RtOverlay.lastSunX()) + "," + String.format("%.2f", RtOverlay.lastSunY())
                 + ") strength=" + String.format("%.2f", RtOverlay.lastStrength()));
         out.add("volume=" + volume.width() + "x" + volume.height() + "x" + volume.depth()
@@ -145,7 +151,10 @@ public final class RtBoot {
                 + " fill=" + (int) (volume.fillFraction() * 100) + "% queued=" + volume.queuedSections()
                 + " filledLastFrame=" + RtOverlay.lastFilled()
                 + " mipCellsRecomputed=" + RtOverlay.lastMipRecomputed()
+                + " mipNonEmpty=" + volume.nonEmptyMipCells()
                 + " uploadPending=" + volume.uploadPending()
+                + " lastUploadBytes=" + RtOverlay.lastUploadedBytes()
+                + " dirtyRows=" + volume.pendingDirtyRows()
                 + " originUploaded=" + volume.uploadedOriginValid()
                 + " originShiftPending=" + volume.originShiftPending()
                 + " prefetch=" + volume.prefetchReady()

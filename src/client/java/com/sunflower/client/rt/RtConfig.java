@@ -42,6 +42,20 @@ public final class RtConfig {
      * 0 = базовая проекция (если террейн рисует Sodium без боба и тени плывут).
      */
     public volatile int useBob = 1;
+    /**
+     * Базовая сила солнечных теней 0..1 (множится на день/дождь).
+     * Раньше было жёстко 0.65 — теперь пользователь настраивает под вкус и GPU.
+     */
+    public volatile float shadowStrength = 0.65F;
+    /**
+     * Мягкость теней: 0 = жёсткие (1 тап), 1 = 4 тапа по диску солнца,
+     * 2 = 8 тапов. Каждый тап — полноценный марш, поэтому на слабом GPU это
+     * прямое умножение стоимости. Дефолт 0 (жёсткие): на GT 650M один тап давал
+     * 34 FPS, четыре тапа могут уронить вдвое — включать осознанно.
+     */
+    public volatile int softShadows = 0;
+    /** Тени облаков: пятна от облаков, едущие по земле вместе с ними. */
+    public volatile boolean cloudShadows = true;
 
     private RtConfig() {}
 
@@ -91,18 +105,21 @@ public final class RtConfig {
         this.rayStride = 4;
         this.shadowDistance = 32;
         this.maxSteps = 64;
+        this.softShadows = 0; // на GT 650M каждый тап — реальная цена
     }
 
     public void applyLowPreset() {
         this.rayStride = 2;
         this.shadowDistance = 64;
         this.maxSteps = 128;
+        this.softShadows = 1;
     }
 
     public void applyMediumPreset() {
         this.rayStride = 1;
         this.shadowDistance = 96;
         this.maxSteps = 192;
+        this.softShadows = 2;
     }
 
     private void normalized() {
@@ -110,6 +127,8 @@ public final class RtConfig {
         shadowDistance = Math.max(16, Math.min(160, shadowDistance));
         maxSteps = Math.max(16, Math.min(256, maxSteps));
         useBob = useBob != 0 ? 1 : 0;
+        softShadows = Math.max(0, Math.min(2, softShadows));
+        shadowStrength = Math.max(0.0F, Math.min(1.0F, shadowStrength));
     }
 
     private static Path file() {

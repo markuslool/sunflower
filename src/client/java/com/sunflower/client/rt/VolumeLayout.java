@@ -76,6 +76,21 @@ public final class VolumeLayout {
         return y * rowBytes;
     }
 
+    /** Первая строка Y в staging, которую занимает секция (локальная координата секции). */
+    public int sectionFirstRow(int syLocal) {
+        return syLocal * 16;
+    }
+
+    /** Последняя строка секции включительно — секция всегда ровно 16 строк. */
+    public int sectionLastRow(int syLocal) {
+        return syLocal * 16 + 15;
+    }
+
+    /** true — все 16 строк секции попадают в бокс по вертикали. */
+    public boolean sectionRowsInside(int syLocal) {
+        return syLocal >= 0 && syLocal < sy && sectionLastRow(syLocal) < h;
+    }
+
     /**
      * Секция бокса, которой принадлежит ячейка L2.
      * Ячейка L2 = 4x4x4 вокселя = ровно одна секция 16^3 (т.к. 16/4 = 4).

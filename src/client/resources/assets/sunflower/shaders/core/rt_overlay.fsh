@@ -18,6 +18,7 @@ layout(std140) uniform RtFrame {
     ivec3 Dims;
     vec4 Params; // x: shadowDist, y: maxSteps, z: strength, w: primaryMax
     vec4 ResPad; // xy: framebuffer size, z: debugMode, w: rayStride (1/2/4)
+    vec4 Misc; // x: time sec, y: sun angular radius, z: soft taps (1/4/8), w: cloudShadows
 };
 
 uniform usamplerBuffer Voxels;
@@ -128,6 +129,108 @@ vec3 dominantNormal(vec3 rd) {
     return vec3(0.0, 0.0, rd.z > 0.0 ? -1.0 : 1.0);
 }
 
+// --- Мягкие тени: один теневой марш по произвольному направлению на солнце ---
+// Вынесено в функцию, чтобы можно было усреднить несколько тапов по диску солнца
+// (жёсткие тени = 1 тап, мягкие = 4/8). Каждый тап — полноценный Hi-DDA марш.
+float shadowMarch(vec3 start, ivec3 originCell, vec3 sunDir, float shadowDist, int maxSteps,
+        ivec3 dims2, int off2) {
+    ivec3 cell;
+    ivec3 stepI;
+    vec3 tMax;
+    vec3 tDelta;
+    float occl = 0.0;
+    int steps = 0;
+    float sCur = 0.0;
+    // Мягкий срез по дистанции: окклюдер на самой границе shadowDist давал полную
+    // тень, а на сантиметр дальше — ноль. Получался жёсткий круг ("разрез") по
+    // всей картинке. Гасим окклюдер, найденный у самого края дальности.
+    float fadeStart = shadowDist * 0.72;
+    for (int outer = 0; outer < 24 && sCur <= shadowDist && occl < 1.0; outer++) {
+        float sC = coarseFind(start, sunDir, sCur, shadowDist, dims2, off2);
+        if (sC < 0.0) {
+            break;
+        }
+        float sF = max(max(sC - 8.01, sCur), 0.0);
+        ddaInit(start + sunDir * sF, sunDir, cell, stepI, tMax, tDelta);
+        float st = sF;
+        float sFineEnd = min(sC + 8.0, shadowDist);
+        for (int i = 0; i < 64 && st <= sFineEnd; i++) {
+            if (steps >= maxSteps) {
+                break;
+            }
+            if (tMax.x < tMax.y && tMax.x < tMax.z) {
+                cell.x += stepI.x;
+                st = sF + tMax.x;
+                tMax.x += tDelta.x;
+            } else if (tMax.y < tMax.z) {
+                cell.y += stepI.y;
+                st = sF + tMax.y;
+                tMax.y += tDelta.y;
+            } else {
+                cell.z += stepI.z;
+                st = sF + tMax.z;
+                tMax.z += tDelta.z;
+            }
+            if (cell == originCell) {
+                continue; // сама поверхность — не окклюдер
+            }
+            steps++;
+            uint m = voxelAt(cell);
+            if (m == 1u || m == 4u) {
+                // Непрозрачный блок или листва: солнцу не просвечивает.
+                occl = 1.0 - smoothstep(fadeStart, shadowDist, st);
+                break;
+            } else if (m == 2u) {
+                occl += 0.5 * (1.0 - smoothstep(fadeStart, shadowDist, st)); // стекло/вода: полутень
+                if (occl >= 1.0) {
+                    occl = 1.0;
+                    break;
+                }
+            }
+        }
+        if (occl >= 1.0 || steps >= maxSteps) {
+            break;
+        }
+        sCur = sFineEnd + 0.01;
+    }
+    return clamp(occl, 0.0, 1.0);
+}
+
+// --- Облачные тени: пятна от облаков, едущие по земле ---
+float hash21(vec2 p) {
+    p = fract(p * vec2(123.34, 456.21));
+    p += dot(p, p + 45.32);
+    return fract(p.x * p.y);
+}
+
+float vnoise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = hash21(i);
+    float b = hash21(i + vec2(1.0, 0.0));
+    float c = hash21(i + vec2(0.0, 1.0));
+    float d = hash21(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+// 1 = облако закрывает солнце (темно), 0 = просвет. Точка проецируется на плоскость
+// облаков вдоль направления на солнце — поэтому пятна едут вместе с облаками.
+float cloudShadow(vec3 wp, vec3 sunDir) {
+    const float cloudY = 192.0;
+    if (sunDir.y <= 0.03) {
+        return 0.0;
+    }
+    float t = (cloudY - wp.y) / sunDir.y;
+    if (t < 0.0) {
+        return 0.0;
+    }
+    vec2 p = (wp + sunDir * t).xz;
+    p += vec2(Misc.x * 0.7, Misc.x * 0.3); // ветер облаков
+    float n = vnoise(p * 0.018) * 0.65 + vnoise(p * 0.045) * 0.35;
+    return smoothstep(0.50, 0.62, n);
+}
+
 void main() {
     vec2 res = ResPad.xy;
     float dbg = ResPad.z;
@@ -236,11 +339,17 @@ void main() {
         return;
     }
 
+    // Затухание у границы рабочей области луча. За пределами бокса (или дальше
+    // primaryMax) rayBox() не попал и луч вернул 1.0, а внутри рисовалась тень —
+    // получалась прямая черта поперёк кадра ("разрез"). Гасим силу тени по мере
+    // приближения к краю. t1 = min(tExit, primaryMax) — реальный конец луча.
+    float edgeFade = smoothstep(0.0, 28.0, t1 - hitT);
+
     // Shadow march toward the sun.
     // Surfaces facing away from the sun are shadowed by definition (no march needed).
     float facing = dot(nrm, SunDir);
     if (facing <= 0.0) {
-        float fb = 1.0 - Params.z;
+        float fb = 1.0 - Params.z * edgeFade;
         fragColor = vec4(fb, fb, fb, 1.0);
         return;
     }
@@ -250,59 +359,40 @@ void main() {
     ivec3 originCell = ivec3(floor(start - vec3(Origin)));
     float shadowDist = Params.x;
     int maxSteps = int(Params.y);
-    float occl = 0.0;
-    int steps = 0;
-    float sCur = 0.0;
-    for (int outer = 0; outer < 24 && sCur <= shadowDist && occl < 1.0; outer++) {
-        float sC = coarseFind(start, SunDir, sCur, shadowDist, dims2, off2);
-        if (sC < 0.0) {
-            break;
-        }
-        float sF = max(max(sC - 8.01, sCur), 0.0);
-        ddaInit(start + SunDir * sF, SunDir, cell, stepI, tMax, tDelta);
-        float st = sF;
-        float sFineEnd = min(sC + 8.0, shadowDist);
-        for (int i = 0; i < 64 && st <= sFineEnd; i++) {
-            if (steps >= maxSteps) {
+
+    // Мягкость: 1 тап = жёсткие тени, 4/8 = усреднение по диску солнца.
+    // Тапы идут по золотому углу, чтобы не было полос от регулярной сетки.
+    int taps = int(Misc.z);
+    float sunR = Misc.y;
+    float acc = 0.0;
+    if (taps <= 1) {
+        acc = shadowMarch(start, originCell, SunDir, shadowDist, maxSteps, dims2, off2);
+    } else {
+        // Базис в плоскости, перпендикулярной солнцу.
+        vec3 up = abs(SunDir.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+        vec3 tang = normalize(cross(up, SunDir));
+        vec3 bitan = cross(SunDir, tang);
+        for (int i = 0; i < 8; i++) {
+            if (i >= taps) {
                 break;
             }
-            if (tMax.x < tMax.y && tMax.x < tMax.z) {
-                cell.x += stepI.x;
-                st = sF + tMax.x;
-                tMax.x += tDelta.x;
-            } else if (tMax.y < tMax.z) {
-                cell.y += stepI.y;
-                st = sF + tMax.y;
-                tMax.y += tDelta.y;
-            } else {
-                cell.z += stepI.z;
-                st = sF + tMax.z;
-                tMax.z += tDelta.z;
-            }
-            if (cell == originCell) {
-                continue; // сама поверхность — не окклюдер
-            }
-            steps++;
-            uint m = voxelAt(cell);
-            if (m == 1u || m == 4u) {
-                // Непрозрачный блок или листва: солнцу не просвечивает.
-                occl = 1.0;
-                break;
-            } else if (m == 2u) {
-                // Стекло/вода/трава: полутень.
-                occl += 0.5;
-                if (occl >= 1.0) {
-                    occl = 1.0;
-                    break;
-                }
-            }
+            float ang = float(i) * 2.39996323; // золотой угол
+            float rad = sqrt((float(i) + 0.5) / float(taps)) * sunR;
+            vec3 d = normalize(SunDir + (tang * cos(ang) + bitan * sin(ang)) * rad);
+            acc += shadowMarch(start, originCell, d, shadowDist, maxSteps, dims2, off2);
         }
-        if (occl >= 1.0 || steps >= maxSteps) {
-            break;
-        }
-        sCur = sFineEnd + 0.01;
+        acc /= float(taps);
     }
 
-    float f = 1.0 - Params.z * clamp(occl, 0.0, 1.0);
+    float occl = acc;
+    if (Misc.w > 0.5) {
+        // Тени от облаков считаем по точке попадания, а не по лучу — иначе пятна
+        // «плыли» бы на границах блоков. 0.75 — облако чуть светлее полной тени,
+        // как в ванилле (там тень от облаков полупрозрачная, а не чёрная).
+        float cs = cloudShadow(ro + rd * hitT, SunDir) * 0.75;
+        occl = max(occl, cs);
+    }
+
+    float f = 1.0 - Params.z * clamp(occl, 0.0, 1.0) * edgeFade;
     fragColor = vec4(f, f, f, 1.0);
 }

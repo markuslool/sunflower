@@ -48,17 +48,31 @@ import org.joml.Matrix4f;
  * </ul>
  */
 public final class RtOverlay {
-    /** mat4 + vec3 + vec3 + ivec3 + ivec3 + vec4 + vec4 по правилам std140. */
-    private static final int FRAME_SIZE = 64 + 16 * 6;
+    /** mat4 + vec3 + vec3 + ivec3 + ivec3 + vec4 + vec4 + vec4 по правилам std140. */
+    private static final int FRAME_SIZE = 64 + 16 * 7;
+
+    /**
+     * usage воксельного кольца: UNIFORM_TEXEL_BUFFER(256) | MAP_WRITE(2) |
+     * COPY_SRC(16) | COPY_DST(8) = 282.
+     * COPY_SRC/DST нужны для device-copy предыдущего слота в новый при частичной
+     * загрузке — см. комментарий у voxelRing.
+     */
+    private static final int VOXEL_USAGE = 256 | 2 | 16 | 8;
+
+    /** usage буфера кадра: UNIFORM(128) | MAP_WRITE(2) = 130. */
+    private static final int FRAME_USAGE = 128 | 2;
 
     private static RenderPipeline pipeline;
     private static MappableRingBuffer frameUbo;
     /**
-     * Воксели в КОЛЬЦЕ на 3 кадра (как ванильный Cloud UTB: тот же usage 258).
-     * Одиночный буфер здесь — гонка: CPU пишет следующий кадр, пока GPU читает
-     * текущий (рваные данные -> мерцание/тряска теней на ходу). Кольцо убирает
-     * ее структурно: пишем всегда в свободный слот, читаем записанный.
-     * rotate() — ТОЛЬКО в кадре аплоада, перед записью (паттерн CloudRenderer).
+     * Воксели в КОЛЬЦЕ на 3 слота. usage = TEXEL_BUFFER(256) | MAP_WRITE(2) |
+     * COPY_SRC(16) | COPY_DST(8) = 282.
+     *
+     * <p>COPY_SRC/COPY_DST обязательны: при частичной записи новый слот кольца
+     * содержит данные трёх загрузок назад, поэтому перед патчем мы копируем в
+     * него предыдущий (актуальный) слот целиком на стороне GPU. Без этой копии
+     * негрязные строки в новом слоте оказываются чужими — шейдер рисует по смеси
+     * свежего и устаревшего, и картинка мерцает синхронно с аплоадами.
      */
     private static MappableRingBuffer voxelRing;
     private static GpuBuffer triBuf;
@@ -76,6 +90,8 @@ public final class RtOverlay {
     private static volatile int lastFilled;
     /** Диагностика: ячеек L2 пересчитано в последнем снапшоте (должно быть мало, не 55296). */
     private static volatile int lastMipRecomputed;
+    /** Диагностика: байт в последнем аплоаде (должно быть мало, а не 3.5МБ). */
+    private static volatile int lastUploadedBytes;
     /** 0 = тени, 1 = чернить найденные поверхности, 2 = весь экран -50% (проверка пасса). */
     private static volatile int debugMode;
     /**
@@ -138,6 +154,11 @@ public final class RtOverlay {
         return lastMipRecomputed;
     }
 
+    /** Байт в последнем аплоаде объёма (диагностика частичной загрузки). */
+    public static int lastUploadedBytes() {
+        return lastUploadedBytes;
+    }
+
     public static void setUseBob(int mode) {
         useBob = mode != 0 ? 1 : 0;
         Sunflower.LOGGER.warn("[sunflower-rt] useBob = {} ({})", useBob,
@@ -178,9 +199,9 @@ public final class RtOverlay {
                 .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
                 .withCull(false)
                 .build();
-        frameUbo = new MappableRingBuffer(() -> "Sunflower RT frame", 130, FRAME_SIZE);
+        frameUbo = new MappableRingBuffer(() -> "Sunflower RT frame", FRAME_USAGE, FRAME_SIZE);
         VoxelVolume vol = RtBoot.volume();
-        voxelRing = new MappableRingBuffer(() -> "Sunflower RT voxels", 258, (int) vol.bytesSize());
+        voxelRing = new MappableRingBuffer(() -> "Sunflower RT voxels", VOXEL_USAGE, (int) vol.bytesSize());
         triBuf = device.createBuffer(() -> "Sunflower RT triangle",
                 GpuBuffer.USAGE_VERTEX | GpuBuffer.USAGE_MAP_WRITE, 36L);
         try (GpuBufferSlice.MappedView view = triBuf.map(false, true)) {
@@ -217,8 +238,17 @@ public final class RtOverlay {
             lastLevelRef = null;
             return;
         }
-        if (!level.dimension().equals(Level.OVERWORLD)) {
-            skipReason = "not overworld";
+        // Измерение больше не ограничено оверворлдом: работает и в Нижнем мире, и в
+        // Эндере, и в мод-измерениях. Без солнца (hasSkylight == false) солнечные
+        // тени бессмысленны — там просто гасим пасс, а не отказываемся от RT целиком.
+        boolean hasSky = true;
+        try {
+            hasSky = level.dimensionType().hasSkyLight();
+        } catch (Exception ignored) {
+            // экзотическая DimensionType без метода — считаем, что небо есть
+        }
+        if (!hasSky) {
+            skipReason = "no skylight in this dimension";
             return;
         }
         Level prev = lastLevelRef != null ? lastLevelRef.get() : null;
@@ -245,7 +275,7 @@ public final class RtOverlay {
         lastSunY = sunY;
         float dayF = clamp((float) (sunY + 0.08) * 3.0F, 0.0F, 1.0F);
         float rainK = 0.35F + 0.65F * clamp(sky.rainBrightness, 0.0F, 1.0F);
-        float strength = 0.65F * dayF * rainK;
+        float strength = RtBoot.config().shadowStrength * dayF * rainK;
         lastStrength = strength;
         if (strength <= 0.01F) {
             skipReason = "night (sunY=" + String.format("%.2f", sunY) + ")";
@@ -255,9 +285,12 @@ public final class RtOverlay {
         // Воксели: recenter + бюджетная докачка + редкий аплоад.
         VoxelVolume vol = RtBoot.volume();
         Vec3 camPos = cam.pos;
-        // Оверворлд v1: фиксированные границы (-64 .. 320). Кастомные измерения — позже.
+        // Границы бокса берём у реального уровня, а не хардкод -64..320:
+        // в Нижнем мире это 0..128, в мод-измерениях — вообще что угодно.
+        int worldMinY = level.getMinY();
+        int worldMaxY = level.getMaxY();
         vol.recenterSmart((int) Math.floor(camPos.x), (int) Math.floor(camPos.y), (int) Math.floor(camPos.z),
-                -64, 320);
+                worldMinY, worldMaxY);
         // Адаптивный бюджет: базовый из конфига + догоняющий при bulk-правках (/fill):
         // большую очередь разбираем ~за 30 кадров без вечных спайков (кап 24/кадр).
         RtConfig cfg = RtBoot.config();
@@ -317,8 +350,19 @@ public final class RtOverlay {
                     .putVec3((float) sunX, (float) sunY, 0.0F)
                     .putIVec3(vol.uploadedOriginX(), vol.uploadedOriginY(), vol.uploadedOriginZ())
                     .putIVec3(vol.width(), vol.height(), vol.depth())
-                    .putVec4((float) cfg.shadowDistance, (float) effSteps, strength, 160.0F)
-                    .putVec4((float) fw, (float) fh, (float) debugMode, (float) cfg.rayStride);
+                    .putVec4((float) cfg.shadowDistance, (float) effSteps, strength,
+                        // Дальность primary-марша привязана к дальности тени, а не к
+                        // захардкоженным 160: иначе при shadowDistance=96 пиксели за
+                        // 96 блоками получали лучи без теней, а при 160 марш упирался
+                        // в лимит итераций.
+                        Math.max(160.0F, (float) cfg.shadowDistance + 32.0F))
+                    .putVec4((float) fw, (float) fh, (float) debugMode, (float) cfg.rayStride)
+                    // x: время для анимации облаков, y: угловой радиус солнца,
+                    // z: тапов мягкости, w: облачные тени
+                    .putVec4((float) (System.nanoTime() / 1_000_000_000.0 % 3600.0),
+                            0.035F,
+                            (float) (cfg.softShadows == 0 ? 1 : cfg.softShadows == 1 ? 4 : 8),
+                            cfg.cloudShadows ? 1.0F : 0.0F);
         }
 
         GpuDevice device = RenderSystem.getDevice();
@@ -338,22 +382,33 @@ public final class RtOverlay {
     }
 
     private static void uploadVoxels(VoxelVolume vol) {
-        byte[] flat = vol.snapshotFlat();
-        lastMipRecomputed = vol.mipRecomputedCount();
+        // Частичная загрузка: только грязные строки Y (+ L2), одним непрерывным
+        // срезом. В покое и при ходьбе это десятки КБ вместо 3.5 МБ.
         try {
+            GpuBuffer prevSlot = voxelRing.currentBuffer();
+            boolean fullWrite = vol.nextUploadIsFull();
             voxelRing.rotate();
-            try (GpuBufferSlice.MappedView view = voxelRing.currentBuffer().map(false, true)) {
-                ByteBuffer buf = view.data();
-                buf.position(0);
-                if (buf.remaining() < flat.length) {
-                    Sunflower.LOGGER.warn("[sunflower-rt] voxel upload skipped: mapped remaining={} < flat={}",
-                            buf.remaining(), flat.length);
-                    return;
-                }
-                buf.put(flat);
+            GpuBuffer target = voxelRing.currentBuffer();
+            if (!fullWrite && prevSlot != target) {
+                // Новый слот кольца содержит данные трёх загрузок назад. Перед
+                // частичным патчем копируем в него предыдущий (актуальный) слот
+                // целиком — копирование device-side, без PCIe. Иначе негрязные
+                // строки остались бы чужими (был баг: тени мерцали при подгрузке
+                // территорий, синхронно с аплоадами).
+                long size = Math.min(prevSlot.size(), target.size());
+                CommandEncoder enc = RenderSystem.getDevice().createCommandEncoder();
+                enc.copyToBuffer(new GpuBufferSlice(prevSlot, 0, size),
+                        new GpuBufferSlice(target, 0, size));
+                enc.submit();
             }
-            // Флаг гасим ТОЛЬКО здесь: если map/put упал, данные докачаются позже.
-            vol.markUploaded();
+            if (vol.uploadDirtyRange(target)) {
+                // Флаг гасим ТОЛЬКО здесь: если map/put упал, данные докачаются позже.
+                vol.markUploaded();
+                lastUploadedBytes = vol.lastUploadedBytes();
+                // Читаем ПОСЛЕ аплоада: раньше счётчик брался до пересборки, и в
+                // статусе L2 всегда выглядел как "0 ячеек" (= небо, теней нет).
+                lastMipRecomputed = vol.mipRecomputedCount();
+            }
         } catch (Exception e) {
             Sunflower.LOGGER.warn("[sunflower-rt] voxel upload failed: {}", e.toString());
         }
