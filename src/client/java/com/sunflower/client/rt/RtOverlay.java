@@ -15,6 +15,8 @@ import com.mojang.blaze3d.systems.CommandEncoder;
 import com.mojang.blaze3d.systems.GpuDevice;
 import com.mojang.blaze3d.systems.RenderPass;
 import com.mojang.blaze3d.systems.RenderSystem;
+import com.mojang.blaze3d.textures.GpuSampler;
+import com.mojang.blaze3d.textures.GpuTextureView;
 import com.mojang.blaze3d.vertex.DefaultVertexFormat;
 import com.sunflower.Sunflower;
 import java.nio.ByteBuffer;
@@ -48,9 +50,6 @@ import org.joml.Matrix4f;
  * </ul>
  */
 public final class RtOverlay {
-    /** mat4 + vec3 + vec3 + ivec3 + ivec3 + vec4 + vec4 + vec4 по правилам std140. */
-    private static final int FRAME_SIZE = 64 + 16 * 7;
-
     /**
      * usage воксельного кольца: UNIFORM_TEXEL_BUFFER(256) | MAP_WRITE(2) |
      * COPY_SRC(16) | COPY_DST(8) = 282.
@@ -61,6 +60,12 @@ public final class RtOverlay {
 
     /** usage буфера кадра: UNIFORM(128) | MAP_WRITE(2) = 130. */
     private static final int FRAME_USAGE = 128 | 2;
+
+    /**
+     * mat4 + vec3 + vec3 + ivec3 + ivec3 + vec4 * 4 по правилам std140.
+     * Появился четвёртый vec4 (Shadow: каскады / PCF / bias / сторона атласа).
+     */
+    private static final int FRAME_SIZE = 64 + 16 * 8;
 
     private static RenderPipeline pipeline;
     private static MappableRingBuffer frameUbo;
@@ -105,6 +110,15 @@ public final class RtOverlay {
      */
     private static volatile int useBob = 1;
 
+    /**
+     * Связка растеризованных карт теней для текущего кадра. Заполняется в том же
+     * кадре, что и растр, и обнуляется при его отказе — тогда основной пасс
+     * не биндит ни UBO, ни текстуру, а шейдер идёт по старому марчу.
+     */
+    private static volatile GpuBufferSlice shadowCascadeUbo;
+    private static volatile GpuTextureView shadowAtlasView;
+    private static volatile GpuSampler shadowSampler;
+
     private RtOverlay() {}
 
     public static boolean isReady() {
@@ -142,6 +156,26 @@ public final class RtOverlay {
 
     public static int useBob() {
         return useBob;
+    }
+
+    /**
+     * Единичный вектор НА СОЛНЦЕ из последнего отрисованного кадра.
+     *
+ * <p>Нужен клипмапу: базис камеры теней строится от этого направления. Вектор
+     * нормализуется здесь же — {@link ShadowClipmap} тоже страхуется, но лишняя
+     * проверка в шейдерной математике не нужна. Массив новый на каждый вызов:
+     * вызывающий не должен уметь его испортить.
+     *
+ * @return {@code float[3]}, никогда null
+ */
+    public static float[] lastSunDirection() {
+        double len = Math.sqrt(lastSunX * lastSunX + lastSunY * lastSunY);
+        if (!(len > 1e-6)) {
+            // Кадр ещё не рисовался или солнце строго в зените/надире — отдаём
+            // заведомо единичный вектор, чтобы клипмап не получил NaN.
+            return new float[] {0.0F, 1.0F, 0.0F};
+        }
+        return new float[] {(float) (lastSunX / len), (float) (lastSunY / len), 0.0F};
     }
 
     /** Диагностика докачки: секций долито в прошлом кадре. */
@@ -191,6 +225,7 @@ public final class RtOverlay {
                 .withFragmentShader(Sunflower.id("core/rt_overlay"))
                 .withBindGroupLayout(BindGroupLayout.builder()
                         .withUniform("RtFrame", UniformType.UNIFORM_BUFFER)
+                        .withUniform("RtCascade", UniformType.UNIFORM_BUFFER)
                         .withUniform("Voxels", UniformType.TEXEL_BUFFER, GpuFormat.R8_UINT)
                         .build())
                 .withColorTargetState(new ColorTargetState(
@@ -271,16 +306,31 @@ public final class RtOverlay {
         double a = sky.sunAngle;
         double sunX = Math.sin(a);
         double sunY = Math.cos(a);
-        lastSunX = sunX;
-        lastSunY = sunY;
         float dayF = clamp((float) (sunY + 0.08) * 3.0F, 0.0F, 1.0F);
         float rainK = 0.35F + 0.65F * clamp(sky.rainBrightness, 0.0F, 1.0F);
-        float strength = RtBoot.config().shadowStrength * dayF * rainK;
-        lastStrength = strength;
+        RtConfig cfg0 = RtBoot.config();
+        float strength = cfg0.shadowStrength * dayF * rainK * cfg0.lightExposure;
         if (strength <= 0.01F) {
-            skipReason = "night (sunY=" + String.format("%.2f", sunY) + ")";
-            return;
+            if (!cfg0.nightLight) {
+                lastSunX = sunX;
+                lastSunY = sunY;
+                lastStrength = 0.0F;
+                skipReason = "night (sunY=" + String.format("%.2f", sunY) + ")";
+                return;
+            }
+            // Ночной свет: солнце за горизонтом, поэтому берём зеркальное
+            // направление (это «луна») и заметно меньшую силу. Иначе марш ушёл бы
+            // под землю и затенял бы только нижние грани блоков.
+            sunX = -sunX;
+            sunY = -sunY;
+            strength = cfg0.shadowStrength * cfg0.lightExposure * 0.35F * rainK;
         }
+        // Клампим сверху: Params.z — это множитель окклюзии, а 1.0 - z*occl при
+        // z > 1 уходит в минус и multiply-бленд рисует мусор вместо тени.
+        strength = Math.min(1.0F, strength);
+        lastSunX = sunX;
+        lastSunY = sunY;
+        lastStrength = strength;
 
         // Воксели: recenter + бюджетная докачка + редкий аплоад.
         VoxelVolume vol = RtBoot.volume();
@@ -293,7 +343,7 @@ public final class RtOverlay {
                 worldMinY, worldMaxY);
         // Адаптивный бюджет: базовый из конфига + догоняющий при bulk-правках (/fill):
         // большую очередь разбираем ~за 30 кадров без вечных спайков (кап 24/кадр).
-        RtConfig cfg = RtBoot.config();
+        RtConfig cfg = cfg0;
         int baseBudget = Math.max(1, cfg.sectionsPerFrame);
         int catchUp = vol.queuedSections() / 30;
         int budget = Math.min(24, Math.max(baseBudget, catchUp));
@@ -342,6 +392,33 @@ public final class RtOverlay {
         } catch (Exception ignored) {
             // fallback на windowRenderState выше
         }
+        GpuDevice device = RenderSystem.getDevice();
+        CommandEncoder encoder = device.createCommandEncoder();
+        GpuBufferSlice triSlice = triBuf.slice();
+
+        // Растеризованные карты теней: один depth-only проход на каскад по реальной
+        // геометрии чанков. Идёт ПЕРЕД основным пассом и ДО записи frame-UBO,
+        // потому что число каскадов в uniform пишется по итогам растра: если растр
+        // упал, в шейдере Shadows.x = 0 и тот сам уходит в прежний марч по вокселям.
+        float cascades = 0.0F;
+        shadowCascadeUbo = null;
+        shadowAtlasView = null;
+        shadowSampler = null;
+        if (cfg.clipmap) {
+            try {
+                ShadowClipmap.Cascade[] layout = RtClipmap.layout(cfg,
+                        (float) camPos.x, (float) camPos.y, (float) camPos.z);
+                if (RtShadowMap.render(encoder, layout, cfg)) {
+                    shadowCascadeUbo = RtShadowMap.cascadeUboSlice();
+                    shadowAtlasView = RtShadowMap.atlasView();
+                    shadowSampler = RtShadowMap.sampler();
+                    cascades = (float) RtShadowMap.cascadeCount();
+                }
+            } catch (Exception e) {
+                Sunflower.LOGGER.warn("[sunflower-rt] clipmap skipped: {}", e.toString());
+            }
+        }
+
         GpuBuffer frame = frameUbo.currentBuffer();
         try (GpuBufferSlice.MappedView view = frame.map(false, true)) {
             Std140Builder.intoBuffer(view.data())
@@ -360,19 +437,23 @@ public final class RtOverlay {
                     // x: время для анимации облаков, y: угловой радиус солнца,
                     // z: тапов мягкости, w: облачные тени
                     .putVec4((float) (System.nanoTime() / 1_000_000_000.0 % 3600.0),
-                            0.035F,
+                            cfg.sunSize,
                             (float) (cfg.softShadows == 0 ? 1 : cfg.softShadows == 1 ? 4 : 8),
-                            cfg.cloudShadows ? 1.0F : 0.0F);
+                            cfg.cloudShadows ? 1.0F : 0.0F)
+                    // x: число каскадов (0 = марч вместо карт), y: тапов PCF,
+                    // z: bias в блоках, w: сторона атласа (2 для сетки 2x2)
+                    .putVec4(cascades, (float) cfg.clipmapPcf, cfg.shadowBias, 2.0F);
         }
 
-        GpuDevice device = RenderSystem.getDevice();
-        CommandEncoder encoder = device.createCommandEncoder();
-        GpuBufferSlice triSlice = triBuf.slice();
         try (RenderPass pass = encoder.createRenderPass(() -> "Sunflower RT",
                 gameRenderer.mainRenderTarget().getColorTextureView(), Optional.empty())) {
             pass.setPipeline(pipeline);
             pass.setUniform("RtFrame", frame);
             pass.setUniform("Voxels", voxelRing.currentBuffer());
+            if (shadowCascadeUbo != null && shadowAtlasView != null && shadowSampler != null) {
+                pass.setUniform("RtCascade", shadowCascadeUbo);
+                pass.bindTexture("ShadowMap", shadowAtlasView, shadowSampler);
+            }
             pass.setVertexBuffer(0, triSlice);
             pass.draw(3, 1, 0, 0);
         }

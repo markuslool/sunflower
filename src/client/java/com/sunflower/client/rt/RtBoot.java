@@ -136,6 +136,23 @@ public final class RtBoot {
         out.add("strength=" + String.format("%.2f", config.shadowStrength)
                 + " soft=" + (config.softShadows == 0 ? "1tap" : config.softShadows == 1 ? "4tap" : "8tap")
                 + " cloud=" + config.cloudShadows);
+        // Клипмап: реальная раскладка каскадов полезнее просто конфига — видно,
+        // не вырождался ли extent какого-нибудь каскада и не разошёлся ли bias.
+        out.add("clipmap=" + (config.clipmap ? "ON" : "off")
+                + " cascades=" + config.cascades
+                + " res=" + config.clipmapResolution
+                + " dist=" + config.clipmapDistance
+                + " pcf=" + config.clipmapPcf
+                + " bias=" + String.format("%.2f", config.shadowBias)
+                + " blend=" + String.format("%.2f", config.cascadeBlend));
+        if (config.clipmap) {
+            out.add("shadowMap ready=" + RtShadowMap.isReady()
+                    + " drawn=" + RtShadowMap.cascadeCount()
+                    + " casters=" + RtShadowMap.lastCastersDrawn()
+                    + "/" + RtShadowMap.lastCastersSeen()
+                    + " (culled " + RtShadowMap.lastCastersCulled() + ")"
+                    + " state=" + RtShadowMap.skipReason());
+        }
         out.add("overlay ready=" + RtOverlay.isReady() + " frames=" + RtOverlay.framesDrawn()
                 + " debug=" + RtOverlay.debugMode() + " bob=" + RtOverlay.useBob()
                 + (RtOverlay.useBob() != 0 ? " (+view-bob, как террейн)" : " (базовая, для Sodium)")

@@ -19,11 +19,93 @@ layout(std140) uniform RtFrame {
     vec4 Params; // x: shadowDist, y: maxSteps, z: strength, w: primaryMax
     vec4 ResPad; // xy: framebuffer size, z: debugMode, w: rayStride (1/2/4)
     vec4 Misc; // x: time sec, y: sun angular radius, z: soft taps (1/4/8), w: cloudShadows
+    vec4 Shadow; // x: cascades (0 = выключено), y: PCF taps, z: bias (блоки), w: atlas side
 };
 
+// Растеризованный клипмап. Per-cascade слоты повторяют структуру RtShadowFrame,
+// чтобы обе стороны считали одинаковую линейную глубину вдоль взгляда света.
+layout(std140) uniform RtCascade {
+    mat4 LightViewProj[4]; // 64 * 4
+    vec4 LightPos[4]; // xyz: ближняя плоскость орто-камеры, w: ширина орто
+    vec4 LightInfo[4]; // x: depthRange, y: texelWorldSize, z: res, w: -
+    vec4 LightRange[4]; // x: nearDist, y: farDist, z: -, w: -
+    vec4 LightFwd[4]; // xyz: направление взгляда камеры теней
+};
+
+uniform sampler2D ShadowMap;
 uniform usamplerBuffer Voxels;
 
 out vec4 fragColor;
+
+// Индекс каскада по расстоянию от камеры до точки попадания.
+int pickCascade(float viewDist) {
+    int n = int(Shadow.x);
+    int ci = 0;
+    for (int i = 0; i < 4; i++) {
+        if (i < n && viewDist >= LightRange[i].x) {
+            ci = i;
+        }
+    }
+    return ci;
+}
+
+// Видимость по растеризованной карте глубины. 1.0 = свет, 0.0 = полная тень.
+// Сравниваем ЛИНЕЙНЫЕ глубины вдоль взгляда света (в блоках), поэтому bias
+// задаётся в блоках и не зависит от near/far конкретного каскада.
+float rasterVisibility(vec3 wp, float viewDist) {
+    int n = int(Shadow.x);
+    if (n <= 0) {
+        return 1.0;
+    }
+    int ci = pickCascade(viewDist);
+    vec4 lp = LightViewProj[ci] * vec4(wp, 1.0);
+    if (lp.w <= 0.0) {
+        return 1.0;
+    }
+    vec3 ndc = lp.xyz / lp.w;
+    // За пределами карты теней считаем освещённым: луч оттуда не мог прийти.
+    if (abs(ndc.x) > 1.0 || abs(ndc.y) > 1.0) {
+        return 1.0;
+    }
+    vec2 uv = ndc.xy * 0.5 + 0.5;
+    // Атлас 2x2: тайл каскада сдвигает UV на полатласа.
+    vec2 tile = vec2(float(ci - (ci / 2) * 2), float(ci / 2)) * 0.5;
+    vec2 auv = tile + uv * 0.5;
+
+    float depthRange = LightInfo[ci].x;
+    float texel = LightInfo[ci].y;
+    float d = texture(ShadowMap, auv).r;
+    // d в [0,1] — линейная глубина от ближней плоскости орто-камеры.
+    float casterZ = d * depthRange;
+    float receiverZ = dot(wp - LightPos[ci].xyz, LightFwd[ci].xyz);
+    float bias = Shadow.z + texel * 0.5;
+
+    // PCF: сэмплируем окрестность в экранных текселях карты теней. Смещение
+    // считаем в мировых единицах и делим на тексель, чтобы фильтр не «плыл»
+    // при смене разрешения карты.
+    int taps = int(Shadow.y);
+    if (taps <= 1) {
+        return receiverZ - bias <= casterZ ? 1.0 : 0.0;
+    }
+    float radius = texel * float(taps - 1) * 0.5;
+    vec2 stepUv = vec2(radius, 0.0) * 0.5; // в UV карты теней, тайл уже учтён
+    float sum = 0.0;
+    int per = (taps + 1) / 2;
+    for (int dy = 0; dy <= 4; dy++) {
+        if (dy >= per) {
+            break;
+        }
+        for (int dx = 0; dx <= 4; dx++) {
+            if (dx >= per) {
+                break;
+            }
+            vec2 o = (vec2(float(dx), float(dy)) - float(per - 1) * 0.5) * stepUv;
+            float cd = texture(ShadowMap, auv + o).r * depthRange;
+            sum += receiverZ - bias <= cd ? 1.0 : 0.0;
+        }
+    }
+    return sum / float(per * per);
+}
 
 uint voxelAt(ivec3 c) {
     if (c.x < 0 || c.y < 0 || c.z < 0 || c.x >= Dims.x || c.y >= Dims.y || c.z >= Dims.z) {
@@ -359,29 +441,35 @@ void main() {
     ivec3 originCell = ivec3(floor(start - vec3(Origin)));
     float shadowDist = Params.x;
     int maxSteps = int(Params.y);
+    float viewDist = length(ro + rd * hitT - CamPos);
 
-    // Мягкость: 1 тап = жёсткие тени, 4/8 = усреднение по диску солнца.
-    // Тапы идут по золотому углу, чтобы не было полос от регулярной сетки.
-    int taps = int(Misc.z);
-    float sunR = Misc.y;
-    float acc = 0.0;
-    if (taps <= 1) {
-        acc = shadowMarch(start, originCell, SunDir, shadowDist, maxSteps, dims2, off2);
+    float acc;
+    if (Shadow.x > 0.5) {
+        // Растеризованный клипмап: вместо марча — выборка готовой карты глубины.
+        acc = 1.0 - rasterVisibility(ro + rd * hitT, viewDist);
     } else {
-        // Базис в плоскости, перпендикулярной солнцу.
-        vec3 up = abs(SunDir.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
-        vec3 tang = normalize(cross(up, SunDir));
-        vec3 bitan = cross(SunDir, tang);
-        for (int i = 0; i < 8; i++) {
-            if (i >= taps) {
-                break;
+        // Мягкость: 1 тап = жёсткие тени, 4/8 = усреднение по диску солнца.
+        // Тапы идут по золотому углу, чтобы не было полос от регулярной сетки.
+        int taps = int(Misc.z);
+        float sunR = Misc.y;
+        if (taps <= 1) {
+            acc = shadowMarch(start, originCell, SunDir, shadowDist, maxSteps, dims2, off2);
+        } else {
+            // Базис в плоскости, перпендикулярной солнцу.
+            vec3 up = abs(SunDir.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+            vec3 tang = normalize(cross(up, SunDir));
+            vec3 bitan = cross(SunDir, tang);
+            for (int i = 0; i < 8; i++) {
+                if (i >= taps) {
+                    break;
+                }
+                float ang = float(i) * 2.39996323; // золотой угол
+                float rad = sqrt((float(i) + 0.5) / float(taps)) * sunR;
+                vec3 d = normalize(SunDir + (tang * cos(ang) + bitan * sin(ang)) * rad);
+                acc += shadowMarch(start, originCell, d, shadowDist, maxSteps, dims2, off2);
             }
-            float ang = float(i) * 2.39996323; // золотой угол
-            float rad = sqrt((float(i) + 0.5) / float(taps)) * sunR;
-            vec3 d = normalize(SunDir + (tang * cos(ang) + bitan * sin(ang)) * rad);
-            acc += shadowMarch(start, originCell, d, shadowDist, maxSteps, dims2, off2);
+            acc /= float(taps);
         }
-        acc /= float(taps);
     }
 
     float occl = acc;

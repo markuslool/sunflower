@@ -1,6 +1,7 @@
 package com.sunflower.client;
 
 import com.mojang.brigadier.arguments.IntegerArgumentType;
+import com.sunflower.client.menu.SunflowerMenuScreen;
 import com.sunflower.client.rt.RtBoot;
 import com.sunflower.client.rt.RtOverlay;
 import net.fabricmc.api.ClientModInitializer;
@@ -19,12 +20,19 @@ public class SunflowerClient implements ClientModInitializer {
 		// Повторные пробы бэкенда + приветствие в чат при входе в мир.
 		ClientTickEvents.END_CLIENT_TICK.register(client -> RtBoot.tick());
 
-		// /sunflower rt — экран настроек (временно, до кнопки в Video Settings 26.2).
+		// /sunflower — главное меню (то же, что кнопка «Sunflower» в меню паузы).
+		// /sunflower rt — сразу настройки RT (вкладки RT / Shadow / Свет).
 		// /sunflower status — диагностика в чат без копания в логах.
 		// /sunflower debug <0|1|2> — режимы визуализации.
 		// /sunflower bob <0|1> — матрица лучей: базовая проекция или с view-bob.
 		ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
 			var root = ClientCommands.literal("sunflower");
+
+			root.executes(ctx -> {
+				Minecraft mc = Minecraft.getInstance();
+				SunflowerMenuScreen.open(mc.gui.screen());
+				return 1;
+			});
 
 			root.then(ClientCommands.literal("rt").executes(ctx -> {
 				Minecraft mc = Minecraft.getInstance();

@@ -57,6 +57,63 @@ public final class RtConfig {
     /** Тени облаков: пятна от облаков, едущие по земле вместе с ними. */
     public volatile boolean cloudShadows = true;
 
+    // --- Вкладка «Свет». Всё это уходит в уже существующие слоты uniform-блока
+    // (Misc.y и силу пасса), поэтому GLSL трогать не пришлось. ---
+
+    /**
+     * Экспозиция солнечного света, множитель к итоговой силе пасса.
+     * 1.0 = как было; 0.5 = тени вдвое мягче по контрасту; 1.5 = тени гуще.
+     * Итог всё равно зажимается в 1.0, иначе multiply-бленд ушёл бы в отрицательные
+     * значения и кадр стал бы чёрным за пределами тени.
+     */
+    public volatile float lightExposure = 1.0F;
+    /**
+     * Угловой радиус солнца в радианах (Misc.y шейдера). Радиус диска задаёт,
+     * насколько широко расходятся тапы мягкости по золотому углу: меньше — тени
+     * резче, больше — мягче и пятнистее у самой границы тени.
+     */
+    public volatile float sunSize = 0.035F;
+    /**
+     * Считать свет ночью. Ночью солнце за горизонтом (sunY &lt; 0), поэтому пасс
+     * целиком гаснет и картинка остаётся без трассировки. С этой опцией берётся
+     * направление на «луну» (зеркальное) и мягкая сила — как лунный свет.
+     */
+    public volatile boolean nightLight = false;
+
+    // --- Вкладка «Трассировка»: каскадная клипмап теней (CSM + shadow clipmap).
+    // Математика живёт в ShadowClipmap, здесь только ручки. ---
+
+    /**
+     * Включить клипмап вместо одиночного марча. Выключенный режим — это прежнее
+     * поведение v1 (один марч на shadowDistance), включённый — каскады с картами
+     * глубины. Дефолт выключен: клипмап требует depth-прохода по геометрии мира,
+     * поэтому включать его имеет смысл только после того, как проход отработает.
+     */
+    public volatile boolean clipmap = false;
+    /** Каскадов в клипмапе, 1..ShadowClipmap.MAX_CASCADES. */
+    public volatile int cascades = 3;
+    /** Разрешение карты глубины одного каскада, пикселей. */
+    public volatile int clipmapResolution = 1024;
+    /**
+     * Дальность, до которой клипмап вообще считает тени, блоков.
+     * Дальше — небо без теней. Должна быть кратна {@link #shadowDistance},
+     * иначе дальние каскады вырождаются в пустые.
+     */
+    public volatile int clipmapDistance = 128;
+    /**
+     * Перекрытие каскадов 0..1. Больше — меньше швов на границах, но больше
+     * разрешения тратится впустую. 0.1 — рабочее значение по умолчанию.
+     */
+    public volatile float cascadeBlend = 0.1F;
+    /** Тапов PCF на каскад: 1 = жёсткая тень, 4/9 = мягче. */
+    public volatile int clipmapPcf = 1;
+    /**
+     * Нормальное смещение теневого луча вдоль нормали поверхности, в текселях.
+     * 0 = без смещения, 2 = типичное значение. Слишком мало — acne (тени полоса��
+     * на плоских полах), слишком много — тени «отрываются» от поверхности (peter-panning).
+     */
+    public volatile float shadowBias = 1.5F;
+
     private RtConfig() {}
 
     public static RtConfig load() {
@@ -106,6 +163,7 @@ public final class RtConfig {
         this.shadowDistance = 32;
         this.maxSteps = 64;
         this.softShadows = 0; // на GT 650M каждый тап — реальная цена
+        this.lightExposure = 1.0F;
     }
 
     public void applyLowPreset() {
@@ -113,6 +171,7 @@ public final class RtConfig {
         this.shadowDistance = 64;
         this.maxSteps = 128;
         this.softShadows = 1;
+        this.lightExposure = 1.0F;
     }
 
     public void applyMediumPreset() {
@@ -120,6 +179,33 @@ public final class RtConfig {
         this.shadowDistance = 96;
         this.maxSteps = 192;
         this.softShadows = 2;
+        this.lightExposure = 1.0F;
+    }
+
+    /** Вкладка «Свет» — вернуть как было: экспозиция 1.0, солнце 0.035, ночь выкл. */
+    public void resetLightSettings() {
+        this.lightExposure = 1.0F;
+        this.sunSize = 0.035F;
+        this.nightLight = false;
+    }
+
+    /** Вкладка «Shadow» — сила 0.65, жёсткие тени, 64 блока, облака включены. */
+    public void resetShadowSettings() {
+        this.shadowDistance = 64;
+        this.maxSteps = 128;
+        this.shadowStrength = 0.65F;
+        this.softShadows = 0;
+    }
+
+    /** Вкладка «Трассировка» — клипмап выключен, 3 каскада, 1024px, PCF 1, bias 1.5. */
+    public void resetClipmapSettings() {
+        this.clipmap = false;
+        this.cascades = 3;
+        this.clipmapResolution = 1024;
+        this.clipmapDistance = 128;
+        this.cascadeBlend = 0.1F;
+        this.clipmapPcf = 1;
+        this.shadowBias = 1.5F;
     }
 
     private void normalized() {
@@ -129,6 +215,28 @@ public final class RtConfig {
         useBob = useBob != 0 ? 1 : 0;
         softShadows = Math.max(0, Math.min(2, softShadows));
         shadowStrength = Math.max(0.0F, Math.min(1.0F, shadowStrength));
+        lightExposure = Math.max(0.25F, Math.min(1.5F, lightExposure));
+        sunSize = Math.max(0.005F, Math.min(0.15F, sunSize));
+        cascades = Math.max(1, Math.min(ShadowClipmap.MAX_CASCADES, cascades));
+        // Минимум 256: ниже карта теней настолько крупная, что тень от блока
+        // размазывается в кашу, и клипмап становится хуже одиночного марча.
+        clipmapResolution = Math.max(256, Math.min(4096, snapPow2(clipmapResolution)));
+        clipmapDistance = Math.max(32, Math.min(256, snapPow2(clipmapDistance)));
+        cascadeBlend = Math.max(0.0F, Math.min(0.5F, cascadeBlend));
+        // PCF — только квадрат из нечётных чисел: 1 (жёсткая), 3, 5, 9.
+        if (clipmapPcf != 1 && clipmapPcf != 3 && clipmapPcf != 5 && clipmapPcf != 9) {
+            clipmapPcf = 1;
+        }
+        shadowBias = Math.max(0.0F, Math.min(4.0F, shadowBias));
+    }
+
+    /** Округление вниз до степени двойки — текстуры любят степени двойки. */
+    private static int snapPow2(int v) {
+        int p = 1;
+        while (p * 2 <= v && p < (1 << 20)) {
+            p *= 2;
+        }
+        return p;
     }
 
     private static Path file() {

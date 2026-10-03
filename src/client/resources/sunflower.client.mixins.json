@@ -6,7 +6,9 @@
 		"SunflowerBackendMixin",
 		"GameRendererMixin",
 		"LevelChunkMixin",
-		"LevelChunkPacketMixin"
+		"LevelChunkPacketMixin",
+		"PauseScreenMixin",
+		"ScreenInvoker"
 	],
 	"injectors": {
 		"defaultRequire": 1
